@@ -1,0 +1,28 @@
+name: 台股籌碼日報
+
+on:
+  schedule:
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Run scanner & send email
+        env:
+          GMAIL_USER:    ${{ secrets.GMAIL_USER }}
+          GMAIL_TO:      ${{ secrets.GMAIL_TO }}
+          GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
+        run: python scanner/main.py
