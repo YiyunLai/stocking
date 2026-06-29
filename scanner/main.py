@@ -59,8 +59,11 @@ def fetch_price(date_str):
         for row in rows:
             code  = row[ci].strip()
             name  = row[ni].strip()
-            price = float(row[pi].replace(",", "") or 0)
-            chg   = float(row[di].replace(",", "") or 0)
+            try:
+                price = float(row[pi].replace(",", "").replace("--", "").strip() or 0)
+                chg   = float(row[di].replace(",", "").replace("--", "").strip() or 0)
+            except (ValueError, AttributeError):
+                continue
             if price > 0:
                 chg_pct = chg / (price - chg) * 100 if (price - chg) != 0 else 0
                 price_map[code] = {"name": name, "price": price, "chg": chg, "chg_pct": chg_pct}
