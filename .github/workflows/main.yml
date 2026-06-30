@@ -6,6 +6,9 @@ on:
     - cron: "30 9 * * 1-5"
   workflow_dispatch:   # 允許手動觸發
 
+permissions:
+  contents: write   # 需要寫入權限才能 commit 報告檔案回 repo
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -27,4 +30,13 @@ jobs:
           GMAIL_TO:      ${{ secrets.GMAIL_TO }}
           GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scanner/main.py
+
+      - name: Commit & push report page
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          git diff --staged --quiet || git commit -m "📊 更新每日報告 $(date +'%Y-%m-%d')"
+          git push
