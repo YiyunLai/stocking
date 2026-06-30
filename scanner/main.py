@@ -16,6 +16,13 @@ SENDER_EMAIL   = os.environ["GMAIL_USER"]
 RECEIVER_EMAIL = os.environ["GMAIL_TO"]
 GMAIL_APP_PWD  = os.environ["GMAIL_APP_PWD"]
 FUGLE_API_KEY  = os.environ.get("FUGLE_API_KEY", "")
+GITHUB_REPO    = os.environ.get("GITHUB_REPOSITORY", "")  # 例如 YiyunLai/stocking，GitHub Actions 自動帶入
+# GitHub Pages 網址格式：https://{user}.github.io/{repo}/
+if GITHUB_REPO and "/" in GITHUB_REPO:
+    _owner, _repo = GITHUB_REPO.split("/")
+    PAGES_BASE_URL = f"https://{_owner}.github.io/{_repo}"
+else:
+    PAGES_BASE_URL = ""
 # ──────────────────────────────────────────────────────
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -327,6 +334,12 @@ def analyze_technical(code, today_chg_pct, today_volume=None):
     else:
         result["爆量長紅"] = "是" if today_chg_pct >= 5 else "否"
 
+    # 保留近 60 天 K 線供畫圖用（只取必要欄位精簡資料量）
+    result["_candles"] = [
+        {"date": c["date"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]}
+        for c in candles[-60:]
+    ]
+
     return result
 
 
@@ -432,6 +445,7 @@ def build_full_data(n_days=6):
             "KD黃金交叉": "", "MACD翻多": "", "布林突破": "", "爆量長紅": "",
             "技術面標籤": "",
             "大戶400張以上%": "", "中實戶50~400張%": "", "散戶50張以下%": "",
+            "_candles": [],
         })
 
     stocks.sort(key=lambda x: -(abs(x["外資今日(張)"]) + abs(x["投信今日(張)"]) * 3))
@@ -462,6 +476,7 @@ def build_full_data(n_days=6):
                 s["MACD翻多"]   = tech["MACD翻多"]
                 s["布林突破"]   = tech["布林突破"]
                 s["爆量長紅"]   = tech["爆量長紅"]
+                s["_candles"]   = tech.get("_candles", [])
 
                 tags = []
                 if tech["均線多頭"] == "是":   tags.append("均線多頭")
@@ -515,81 +530,169 @@ def make_csv(stocks):
     output = io.StringIO()
     if not stocks:
         return output.getvalue()
-    fieldnames = list(stocks[0].keys())
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    fieldnames = [k for k in stocks[0].keys() if not k.startswith("_")]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(stocks)
     return output.getvalue()
 
-def make_html_summary(stocks, date_str):
+def render_mini_candlestick_svg(candles, width=260, height=110):
+    """用純 SVG 畫迷你K線圖，不依賴外部套件，Email/網頁都能直接顯示"""
+    if not candles or len(candles) < 2:
+        return '<div style="color:#888;font-size:11px;padding:20px;text-align:center">無K線資料</div>'
+
+    highs = [c["h"] for c in candles]
+    lows  = [c["l"] for c in candles]
+    vmax, vmin = max(highs), min(lows)
+    vrange = vmax - vmin if vmax != vmin else 1
+
+    n = len(candles)
+    candle_w = width / n
+    body_w = max(candle_w * 0.6, 1.5)
+
+    def y(price):
+        return height - ((price - vmin) / vrange) * (height - 10) - 5
+
+    bars = []
+    for i, c in enumerate(candles):
+        x_center = i * candle_w + candle_w / 2
+        is_up = c["c"] >= c["o"]
+        color = "#e34948" if is_up else "#1baf7a"
+        y_open, y_close = y(c["o"]), y(c["c"])
+        y_high, y_low   = y(c["h"]), y(c["l"])
+        body_top = min(y_open, y_close)
+        body_height = max(abs(y_close - y_open), 1)
+        bars.append(
+            f'<line x1="{x_center:.1f}" y1="{y_high:.1f}" x2="{x_center:.1f}" y2="{y_low:.1f}" stroke="{color}" stroke-width="1"/>'
+            f'<rect x="{x_center - body_w/2:.1f}" y="{body_top:.1f}" width="{body_w:.1f}" height="{body_height:.1f}" fill="{color}"/>'
+        )
+
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="background:#1a1a1a;border-radius:6px">'
+        + "".join(bars) +
+        '</svg>'
+    )
+
+def make_report_page(stocks, date_str):
+    """完整版報告網頁（含K線圖），用於 GitHub Pages 發布"""
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
     cats = ["強勢噴出", "低位啟動", "趨勢持續"]
     cat_desc = {
-        "強勢噴出": "🔴 強勢噴出 — 股價接近52週高點、近期漲幅強、法人買超，適合追強短線",
-        "低位啟動": "🟢 低位啟動 — 股價位於52週相對低位、剛站上/翻揚MA20，適合波段布局",
-        "趨勢持續": "🟡 趨勢持續 — 介於兩者之間，法人持續買進，適合持有或輕追",
+        "強勢噴出": ("🔴", "強勢噴出", "股價接近52週高點、近期漲幅強、法人買超，適合追強短線"),
+        "低位啟動": ("🟢", "低位啟動", "股價位於52週相對低位、剛站上/翻揚MA20，適合波段布局"),
+        "趨勢持續": ("🟡", "趨勢持續", "介於兩者之間，法人持續買進，適合持有或輕追"),
     }
 
-    def cn(n):
-        if n == "" or n is None: return "—"
-        if isinstance(n, (int, float)):
-            if n > 0: return f'<span style="color:#c0392b">+{n:,.0f}</span>' if n == int(n) else f'<span style="color:#c0392b">+{n:,}</span>'
-            if n < 0: return f'<span style="color:#27ae60">{n:,.0f}</span>' if n == int(n) else f'<span style="color:#27ae60">{n:,}</span>'
-            return "—"
-        return str(n)
+    def tag_html(label, active):
+        color = {
+            "均線多頭": "#4dabf7", "KD黃金交叉": "#51cf66",
+            "MACD翻多": "#ff8787", "布林突破": "#cc5de8", "爆量長紅": "#ffa94d",
+        }.get(label, "#888")
+        opacity = "1" if active else "0.25"
+        return f'<span style="font-size:10px;padding:2px 6px;border-radius:10px;background:{color}33;color:{color};border:1px solid {color}66;opacity:{opacity};white-space:nowrap">{label}</span>'
 
-    def cp(p):
-        if p == "" or p is None: return "—"
-        try:
-            p = float(p)
-            if p > 0: return f'<span style="color:#c0392b">+{p:.2f}%</span>'
-            if p < 0: return f'<span style="color:#27ae60">{p:.2f}%</span>'
-            return f"{p:.2f}%"
-        except: return str(p)
+    cards_by_cat = {}
+    for cat in cats:
+        group = [s for s in stocks if s["類型"] == cat]
+        cards = ""
+        for s in group:
+            chg_color = "#e34948" if s["漲跌%"] >= 0 else "#1baf7a"
+            chg_sign  = "+" if s["漲跌%"] >= 0 else ""
+            chart_svg = render_mini_candlestick_svg(s.get("_candles", []))
+
+            tags_html = "".join([
+                tag_html("均線多頭", s["均線多頭"]=="是"),
+                tag_html("KD黃金交叉", s["KD黃金交叉"]=="是"),
+                tag_html("MACD翻多", s["MACD翻多"]=="是"),
+                tag_html("布林突破", s["布林突破"]=="是"),
+                tag_html("爆量長紅", s["爆量長紅"]=="是"),
+            ])
+
+            pct_label = f'{s["52週位階%"]}%' if s["52週位階%"] != "" else "—"
+
+            cards += f"""
+            <div style="background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+                <div>
+                  <div style="font-size:15px;font-weight:600">{s['代號']} {s['名稱']}</div>
+                  <div style="font-size:12px;color:#888;margin-top:2px">52週位階 {pct_label}</div>
+                </div>
+                <div style="text-align:right">
+                  <div style="font-size:17px;font-weight:600">{s['收盤價']:.2f}</div>
+                  <div style="font-size:12px;color:{chg_color}">{chg_sign}{s['漲跌%']:.2f}%</div>
+                </div>
+              </div>
+              <div style="margin-bottom:8px">{chart_svg}</div>
+              <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px">{tags_html}</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:11px;text-align:center;background:#f8f8f8;border-radius:8px;padding:6px 0">
+                <div><div style="color:#999">外資</div><div style="font-weight:500">{s['外資今日(張)']:+,}</div><div style="color:#aaa">連{s['外資連買天數']}天</div></div>
+                <div><div style="color:#999">投信</div><div style="font-weight:500">{s['投信今日(張)']:+,}</div><div style="color:#aaa">連{s['投信連買天數']}天</div></div>
+                <div><div style="color:#999">大戶%</div><div style="font-weight:500">{s['大戶400張以上%'] or '—'}</div></div>
+              </div>
+            </div>"""
+        cards_by_cat[cat] = (cards, len(group))
 
     sections = ""
     for cat in cats:
-        group = [s for s in stocks if s["類型"] == cat]
-        if not group: continue
-        rows_html = ""
-        for s in group:
-            pct_label = f'{s["52週位階%"]}%' if s["52週位階%"] != "" else "—"
-            tag_label = s["技術面標籤"] if s["技術面標籤"] else "—"
-            rows_html += f"""<tr style="border-bottom:1px solid #f0f0f0">
-  <td style="padding:8px 6px;font-weight:500;white-space:nowrap">{s['代號']}<br><span style="font-size:11px;color:#888;font-weight:400">{s['名稱']}</span></td>
-  <td style="padding:8px 6px;text-align:right">{s['收盤價']:.2f}<br><span style="font-size:11px">{cp(s['漲跌%'])}</span></td>
-  <td style="padding:8px 6px;text-align:right;font-size:12px">{pct_label}</td>
-  <td style="padding:8px 6px;font-size:11px;color:#555">{tag_label}</td>
-  <td style="padding:8px 6px;text-align:right">{cn(s['外資今日(張)'])}<br><span style="font-size:11px;color:#888">連{s['外資連買天數']}天｜5日{cn(s['外資5日累計(張)'])}</span></td>
-  <td style="padding:8px 6px;text-align:right">{cn(s['投信今日(張)'])}<br><span style="font-size:11px;color:#888">連{s['投信連買天數']}天｜5日{cn(s['投信5日累計(張)'])}</span></td>
-  <td style="padding:8px 6px;text-align:right;font-size:12px">{s['大戶400張以上%'] or '—'}<br>{s['中實戶50~400張%'] or '—'}<br>{s['散戶50張以下%'] or '—'}</td>
-</tr>"""
-        sections += f"""<div style="margin-bottom:28px">
-  <div style="font-size:15px;font-weight:600;margin-bottom:4px">{cat_desc[cat]} <span style="font-size:12px;font-weight:400;color:#888">{len(group)} 檔</span></div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px">
-    <thead><tr style="background:#f8f8f8;color:#555">
-      <th style="padding:7px 6px;text-align:left">代號/名稱</th>
-      <th style="padding:7px 6px;text-align:right">收盤/漲跌</th>
-      <th style="padding:7px 6px;text-align:right">52週位階</th>
-      <th style="padding:7px 6px;text-align:left">技術面標籤</th>
-      <th style="padding:7px 6px;text-align:right">外資(張)</th>
-      <th style="padding:7px 6px;text-align:right">投信(張)</th>
-      <th style="padding:7px 6px;text-align:right">大戶%/中實戶%/散戶%</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-</div>"""
+        emoji, label, desc = cat_desc[cat]
+        cards, count = cards_by_cat[cat]
+        if count == 0:
+            continue
+        sections += f"""
+        <section style="margin-bottom:36px">
+          <div style="font-size:18px;font-weight:700;margin-bottom:4px">{emoji} {label} <span style="font-size:13px;font-weight:400;color:#888">{count} 檔</span></div>
+          <div style="font-size:13px;color:#888;margin-bottom:14px">{desc}</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px">{cards}</div>
+        </section>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台股籌碼日報 {y}/{m}/{d}</title>
+</head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#1a1a1a;margin:0;padding:0">
+<div style="max-width:1100px;margin:0 auto;padding:28px 16px 60px">
+  <div style="border-bottom:2px solid #1a1a1a;padding-bottom:14px;margin-bottom:28px">
+    <div style="font-size:24px;font-weight:700">📊 台股籌碼日報</div>
+    <div style="font-size:13px;color:#888;margin-top:4px">{y}/{m}/{d} 盤後 · 共 {len(stocks)} 檔入選 · 資料來源：TWSE、富果行情 API</div>
+  </div>
+  {sections}
+  <div style="border-top:1px solid #ddd;padding-top:16px;margin-top:20px;font-size:12px;color:#aaa">
+    僅供參考，不構成投資建議 · 每日約 17:30 自動更新
+  </div>
+</div>
+</body></html>"""
+
+
+def make_html_summary(stocks, date_str):
+    y, m, d = date_str[:4], date_str[4:6], date_str[6:]
+    cats = ["強勢噴出", "低位啟動", "趨勢持續"]
+    cat_emoji = {"強勢噴出": "🔴", "低位啟動": "🟢", "趨勢持續": "🟡"}
+    REPORT_URL = f"{PAGES_BASE_URL}/reports/{y}{m}{d}.html" if PAGES_BASE_URL else "#"
+
+    counts_html = ""
+    for cat in cats:
+        n = len([s for s in stocks if s["類型"] == cat])
+        if n == 0:
+            continue
+        counts_html += f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0"><span>{cat_emoji[cat]} {cat}</span><span style="font-weight:600">{n} 檔</span></div>'
 
     return f"""<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,sans-serif;background:#fff;color:#222;margin:0;padding:0">
-<div style="max-width:840px;margin:0 auto;padding:20px 16px">
-  <div style="border-bottom:2px solid #222;padding-bottom:10px;margin-bottom:20px">
-    <div style="font-size:19px;font-weight:700">📊 台股籌碼日報</div>
-    <div style="font-size:12px;color:#888;margin-top:3px">{y}/{m}/{d} 盤後 · 共 {len(stocks)} 檔入選 · 詳細資料見附件 CSV</div>
-  </div>
-  {sections}
-  <div style="border-top:1px solid #eee;padding-top:12px;font-size:11px;color:#aaa">
-    資料來源：台灣證券交易所（TWSE）、富果行情 API · 僅供參考，不構成投資建議
+<div style="max-width:480px;margin:0 auto;padding:28px 20px">
+  <div style="font-size:20px;font-weight:700;margin-bottom:4px">📊 台股籌碼日報</div>
+  <div style="font-size:13px;color:#888;margin-bottom:20px">{y}/{m}/{d} 盤後 · 共 {len(stocks)} 檔入選</div>
+
+  <div style="margin-bottom:20px">{counts_html}</div>
+
+  <a href="{REPORT_URL}" style="display:block;text-align:center;background:#1a1a1a;color:#fff;text-decoration:none;padding:14px;border-radius:10px;font-size:15px;font-weight:600;margin-bottom:12px">
+    📈 查看完整報告（含K線圖）
+  </a>
+
+  <div style="font-size:12px;color:#aaa;text-align:center">
+    詳細數據另附 CSV · 資料來源：TWSE、富果行情 API<br>僅供參考，不構成投資建議
   </div>
 </div></body></html>"""
 
@@ -624,6 +727,28 @@ def main():
         print("❌ 無資料，結束。")
         return
     print(f"\n✅ 共 {len(stocks)} 檔")
+
+    y, m, d = date_used[:4], date_used[4:6], date_used[6:]
+
+    # 1. 完整報告網頁（含K線圖）→ 輸出到 docs/reports/，供 GitHub Pages 發布
+    report_html = make_report_page(stocks, date_used)
+    reports_dir = os.path.join(os.path.dirname(__file__), "..", "docs", "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    report_path = os.path.join(reports_dir, f"{y}{m}{d}.html")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_html)
+    print(f"✅ 報告網頁已寫入：{report_path}")
+
+    # 2. 首頁（docs/index.html）導向最新報告，方便直接開根網址就看到今天
+    docs_dir = os.path.join(os.path.dirname(__file__), "..", "docs")
+    index_path = os.path.join(docs_dir, "index.html")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8">'
+                 f'<meta http-equiv="refresh" content="0; url=reports/{y}{m}{d}.html"></head>'
+                 f'<body>導向最新報告...<a href="reports/{y}{m}{d}.html">點此查看</a></body></html>')
+    print(f"✅ 首頁導向已更新：{index_path}")
+
+    # 3. CSV + Email（內容為摘要＋報告連結）
     csv_str = make_csv(stocks)
     html    = make_html_summary(stocks, date_used)
     send_email(html, csv_str, date_used, len(stocks))
