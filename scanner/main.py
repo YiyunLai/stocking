@@ -43,10 +43,12 @@ def fetch_institutional(date_str):
         r = requests.get(url, headers=HEADERS, timeout=20)
         data = r.json()
         if data.get("stat") != "OK" or not data.get("data"):
+            print(f"    （{date_str} stat={data.get('stat')}，data筆數={len(data.get('data',[]))}）")
             return None, None
         date_used = data.get("date", date_str)
         return pd.DataFrame(data["data"], columns=data["fields"]), date_used
-    except:
+    except Exception as e:
+        print(f"    （{date_str} 例外：{e}）")
         return None, None
 
 def fetch_price(date_str):
@@ -55,14 +57,26 @@ def fetch_price(date_str):
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         data = r.json()
-    except:
+    except Exception as e:
+        print(f"  ⚠️ fetch_price 例外：{e}")
         return {}
+
+    if data.get("stat") != "OK":
+        print(f"  ⚠️ fetch_price stat 異常：{data.get('stat')}")
+        return {}
+
+    tables = data.get("tables", [])
+    print(f"  ℹ️ fetch_price 共有 {len(tables)} 個 table")
+
     price_map = {}
-    for table in data.get("tables", []):
+    for idx, table in enumerate(tables):
+        if not isinstance(table, dict):
+            continue
         fields = table.get("fields", [])
         rows   = table.get("data", [])
         if "收盤價" not in fields:
             continue
+        print(f"  ℹ️ table[{idx}] 命中「收盤價」欄位，共 {len(rows)} 列，標題：{table.get('title','')[:30]}")
         ci = fields.index("證券代號")
         ni = fields.index("證券名稱")
         pi = fields.index("收盤價")
@@ -73,11 +87,12 @@ def fetch_price(date_str):
             try:
                 price = float(row[pi].replace(",","").replace("--","").strip() or 0)
                 chg   = float(row[di].replace(",","").replace("--","").strip() or 0)
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, IndexError):
                 continue
             if price > 0:
                 chg_pct = chg / (price - chg) * 100 if (price - chg) != 0 else 0
                 price_map[code] = {"name": name, "price": price, "chg": chg, "chg_pct": chg_pct}
+    print(f"  ℹ️ fetch_price 最終取得 {len(price_map)} 檔股價")
     return price_map
 
 def parse_int(s):
@@ -331,7 +346,7 @@ def build_full_data(n_days=6):
             print(f"  ✅ {du or d} 三大法人 OK（{len(df)} 筆）")
         else:
             print(f"  ⚠️  {d} 無資料")
-        time.sleep(0.5)
+        time.sleep(1.5)
 
     if not daily_inst:
         print("❌ 無法取得任何三大法人資料")
