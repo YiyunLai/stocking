@@ -2,8 +2,9 @@ name: 台股籌碼日報
 
 on:
   schedule:
+    # 每天 UTC 09:30 = 台灣時間 17:30（盤後資料通常 16:30–17:00 公布）
     - cron: "30 9 * * 1-5"
-  workflow_dispatch:
+  workflow_dispatch:   # 允許手動觸發
 
 jobs:
   scan:
@@ -25,4 +26,5 @@ jobs:
           GMAIL_USER:    ${{ secrets.GMAIL_USER }}
           GMAIL_TO:      ${{ secrets.GMAIL_TO }}
           GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
+          FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
         run: python scanner/main.py
