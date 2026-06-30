@@ -168,23 +168,151 @@ def fetch_52w_stats(code):
     except:
         return None
 
-def fetch_ma20_status(code):
-    """判斷是否站上 MA20，以及 MA20 是否翻揚（近5日 MA20 上升）"""
+def fetch_candles(code, days=130):
+    """抓歷史日K（OHLCV），免費方案可用，一次呼叫取得完整序列"""
     today = datetime.today()
-    date_from = (today - timedelta(days=45)).strftime("%Y-%m-%d")
+    date_from = (today - timedelta(days=days)).strftime("%Y-%m-%d")
     date_to   = today.strftime("%Y-%m-%d")
-    data = fugle_get(f"/technical/sma/{code}", {
-        "from": date_from, "to": date_to, "timeframe": "D", "period": 20
+    data = fugle_get(f"/historical/candles/{code}", {
+        "from": date_from, "to": date_to, "timeframe": "D",
+        "fields": "open,high,low,close,volume", "sort": "asc"
     })
     if not data or not data.get("data"):
         return None
     series = data["data"]
-    if len(series) < 5:
+    if len(series) < 25:
         return None
-    latest_ma20 = series[-1]["sma"]
-    prev5_ma20  = series[-5]["sma"] if len(series) >= 5 else series[0]["sma"]
-    ma20_rising = latest_ma20 > prev5_ma20
-    return {"MA20": round(latest_ma20, 2), "MA20翻揚": "是" if ma20_rising else "否"}
+    return series  # list of {date, open, high, low, close, volume}, 由舊到新排序
+
+def compute_sma(closes, period):
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+def compute_sma_series(closes, period):
+    if len(closes) < period:
+        return []
+    return [sum(closes[i-period+1:i+1]) / period for i in range(period-1, len(closes))]
+
+def compute_kdj(candles, r_period=9, k_period=3, d_period=3):
+    """RSV → K → D，回傳最後兩筆 K/D 供判斷黃金交叉"""
+    if len(candles) < r_period + d_period:
+        return None
+    closes = [c["close"] for c in candles]
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+
+    k_vals, d_vals = [], []
+    k_prev, d_prev = 50.0, 50.0
+    for i in range(len(candles)):
+        if i < r_period - 1:
+            k_vals.append(None); d_vals.append(None)
+            continue
+        period_high = max(highs[i-r_period+1:i+1])
+        period_low  = min(lows[i-r_period+1:i+1])
+        rsv = 50.0 if period_high == period_low else (closes[i] - period_low) / (period_high - period_low) * 100
+        k = (2/3)*k_prev + (1/3)*rsv
+        d = (2/3)*d_prev + (1/3)*k
+        k = max(0, min(100, k))
+        d = max(0, min(100, d))
+        k_vals.append(k); d_vals.append(d)
+        k_prev, d_prev = k, d
+
+    valid = [(k,d) for k,d in zip(k_vals, d_vals) if k is not None]
+    if len(valid) < 2:
+        return None
+    (pk, pd_), (ck, cd) = valid[-2], valid[-1]
+    golden_cross = (pk <= pd_) and (ck > cd)
+    return {"K值": round(ck,1), "D值": round(cd,1), "KD黃金交叉": "是" if golden_cross else "否"}
+
+def compute_ema_series(values, period):
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(values[:period]) / period]
+    for v in values[period:]:
+        ema.append(v * k + ema[-1] * (1 - k))
+    return ema
+
+def compute_macd(candles, fast=12, slow=26, signal=9):
+    closes = [c["close"] for c in candles]
+    if len(closes) < slow + signal:
+        return None
+    ema_fast = compute_ema_series(closes, fast)
+    ema_slow = compute_ema_series(closes, slow)
+    offset = len(ema_fast) - len(ema_slow)
+    macd_line = [f - s for f, s in zip(ema_fast[offset:], ema_slow)]
+    if len(macd_line) < signal + 1:
+        return None
+    signal_line = compute_ema_series(macd_line, signal)
+    macd_aligned = macd_line[-len(signal_line):]
+    hist = [m - s for m, s in zip(macd_aligned, signal_line)]
+    if len(hist) < 2:
+        return None
+    prev_hist, curr_hist = hist[-2], hist[-1]
+    macd_turn_bullish = (prev_hist <= 0) and (curr_hist > 0)
+    return {"MACD翻多": "是" if macd_turn_bullish else "否"}
+
+def compute_bbands(closes, period=20, num_std=2):
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    mean = sum(window) / period
+    variance = sum((x - mean) ** 2 for x in window) / period
+    std = variance ** 0.5
+    upper = mean + num_std * std
+    return {"布林上軌": round(upper, 2)}
+
+def analyze_technical(code, today_chg_pct, today_volume=None):
+    """一次抓K線、自算全部技術面指標，回傳 5 個訊號標籤"""
+    candles = fetch_candles(code)
+    if not candles:
+        return None
+
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+
+    ma5  = compute_sma(closes, 5)
+    ma20 = compute_sma(closes, 20)
+    ma60 = compute_sma(closes, 60)
+    ma20_series = compute_sma_series(closes, 20)
+
+    result = {
+        "MA5": round(ma5,2) if ma5 else "",
+        "MA20": round(ma20,2) if ma20 else "",
+        "MA60": round(ma60,2) if ma60 else "",
+        "均線多頭": "否", "MA20翻揚": "否",
+        "KD黃金交叉": "否", "MACD翻多": "否", "布林突破": "否", "爆量長紅": "否",
+    }
+
+    if ma5 and ma20 and ma60:
+        result["均線多頭"] = "是" if (ma5 > ma20 > ma60) else "否"
+    if len(ma20_series) >= 5:
+        result["MA20翻揚"] = "是" if ma20_series[-1] > ma20_series[-5] else "否"
+
+    kd = compute_kdj(candles)
+    if kd:
+        result["KD黃金交叉"] = kd["KD黃金交叉"]
+
+    macd = compute_macd(candles)
+    if macd:
+        result["MACD翻多"] = macd["MACD翻多"]
+
+    bb = compute_bbands(closes)
+    if bb and closes:
+        result["布林突破"] = "是" if closes[-1] > bb["布林上軌"] else "否"
+        result["布林上軌"] = bb["布林上軌"]
+
+    # 爆量長紅：今日量 > 近5日均量的1.5倍，且漲幅>=3%
+    if len(volumes) >= 6:
+        avg_vol5 = sum(volumes[-6:-1]) / 5
+        vol_today = volumes[-1]
+        vol_spike = avg_vol5 > 0 and vol_today > avg_vol5 * 1.5
+        result["爆量長紅"] = "是" if (vol_spike and today_chg_pct >= 3) else "否"
+    else:
+        result["爆量長紅"] = "是" if today_chg_pct >= 5 else "否"
+
+    return result
 
 
 # ════════════════════════════════════════════════════════
@@ -284,7 +412,10 @@ def build_full_data(n_days=6):
             "投信5日累計(張)": t_5d,
             "自營5日累計(張)": d_5d,
             "52週高": "", "52週低": "", "52週位階%": "",
-            "MA20": "", "MA20翻揚": "",
+            "MA5": "", "MA20": "", "MA60": "",
+            "均線多頭": "", "MA20翻揚": "",
+            "KD黃金交叉": "", "MACD翻多": "", "布林突破": "", "爆量長紅": "",
+            "技術面標籤": "",
             "大戶400張以上%": "", "中實戶50~400張%": "", "散戶50張以下%": "",
         })
 
@@ -300,16 +431,31 @@ def build_full_data(n_days=6):
         if has_fugle:
             stats = fetch_52w_stats(code)
             if stats:
-                s["52週高"]   = stats["52週高"]
-                s["52週低"]   = stats["52週低"]
+                s["52週高"]    = stats["52週高"]
+                s["52週低"]    = stats["52週低"]
                 s["52週位階%"] = stats["52週位階%"]
-            time.sleep(0.15)
+            time.sleep(0.3)
 
-            ma = fetch_ma20_status(code)
-            if ma:
-                s["MA20"]     = ma["MA20"]
-                s["MA20翻揚"] = ma["MA20翻揚"]
-            time.sleep(0.15)
+            tech = analyze_technical(code, s["漲跌%"])
+            if tech:
+                s["MA5"]        = tech["MA5"]
+                s["MA20"]       = tech["MA20"]
+                s["MA60"]       = tech["MA60"]
+                s["均線多頭"]    = tech["均線多頭"]
+                s["MA20翻揚"]   = tech["MA20翻揚"]
+                s["KD黃金交叉"] = tech["KD黃金交叉"]
+                s["MACD翻多"]   = tech["MACD翻多"]
+                s["布林突破"]   = tech["布林突破"]
+                s["爆量長紅"]   = tech["爆量長紅"]
+
+                tags = []
+                if tech["均線多頭"] == "是":   tags.append("均線多頭")
+                if tech["KD黃金交叉"] == "是": tags.append("KD黃金交叉")
+                if tech["MACD翻多"] == "是":   tags.append("MACD翻多")
+                if tech["布林突破"] == "是":   tags.append("布林突破")
+                if tech["爆量長紅"] == "是":   tags.append("爆量長紅")
+                s["技術面標籤"] = "、".join(tags) if tags else "—"
+            time.sleep(0.3)
 
         own = fetch_ownership_distribution(code)
         if own:
@@ -318,21 +464,19 @@ def build_full_data(n_days=6):
             s["散戶50張以下%"]   = own["散戶50張以下%"]
         time.sleep(0.6)
 
-        # ── 分類邏輯（相對位階 + 均線 + 法人動向）──
-        chg_pct   = s["漲跌%"]
+        # ── 分類邏輯（相對位階 + 均線 + 法人動向 + 技術面標籤數）──
+        chg_pct    = s["漲跌%"]
         percentile = s["52週位階%"]
-        ma20_up    = (s["MA20翻揚"] == "是")
-        above_ma20 = (s["MA20"] != "" and s["收盤價"] > s["MA20"])
+        tag_count  = len([t for t in [s["均線多頭"],s["KD黃金交叉"],s["MACD翻多"],s["布林突破"],s["爆量長紅"]] if t == "是"])
 
         if has_fugle and percentile != "":
-            if percentile >= 75 and (chg_pct > 3 or s["外資今日(張)"] > 300 or s["投信今日(張)"] > 200):
+            if percentile >= 75 and (chg_pct > 3 or s["外資今日(張)"] > 300 or s["投信今日(張)"] > 200 or tag_count >= 3):
                 category = "強勢噴出"
-            elif percentile <= 35 and (above_ma20 or ma20_up) and (foreign_today > 0 or trust_today > 0):
+            elif percentile <= 35 and (s["均線多頭"] == "是" or s["MA20翻揚"] == "是") and (foreign_today > 0 or trust_today > 0):
                 category = "低位啟動"
             else:
                 category = "趨勢持續"
         else:
-            # 富果未設定時，退回原本以絕對股價與漲幅判斷的簡易邏輯
             if chg_pct > 5 or (chg_pct > 3 and (foreign_today > 300 or trust_today > 200)):
                 category = "強勢噴出"
             elif chg_pct < 2 and (foreign_today > 0 or trust_today > 0) and pd_info["price"] < 150:
@@ -395,11 +539,12 @@ def make_html_summary(stocks, date_str):
         rows_html = ""
         for s in group:
             pct_label = f'{s["52週位階%"]}%' if s["52週位階%"] != "" else "—"
-            ma_label  = f'{"站上" if (s["MA20"]!="" and s["收盤價"]>s["MA20"]) else "跌破"}MA20' if s["MA20"]!="" else "—"
+            tag_label = s["技術面標籤"] if s["技術面標籤"] else "—"
             rows_html += f"""<tr style="border-bottom:1px solid #f0f0f0">
   <td style="padding:8px 6px;font-weight:500;white-space:nowrap">{s['代號']}<br><span style="font-size:11px;color:#888;font-weight:400">{s['名稱']}</span></td>
   <td style="padding:8px 6px;text-align:right">{s['收盤價']:.2f}<br><span style="font-size:11px">{cp(s['漲跌%'])}</span></td>
-  <td style="padding:8px 6px;text-align:right;font-size:12px">{pct_label}<br><span style="color:#888">{ma_label}</span></td>
+  <td style="padding:8px 6px;text-align:right;font-size:12px">{pct_label}</td>
+  <td style="padding:8px 6px;font-size:11px;color:#555">{tag_label}</td>
   <td style="padding:8px 6px;text-align:right">{cn(s['外資今日(張)'])}<br><span style="font-size:11px;color:#888">連{s['外資連買天數']}天｜5日{cn(s['外資5日累計(張)'])}</span></td>
   <td style="padding:8px 6px;text-align:right">{cn(s['投信今日(張)'])}<br><span style="font-size:11px;color:#888">連{s['投信連買天數']}天｜5日{cn(s['投信5日累計(張)'])}</span></td>
   <td style="padding:8px 6px;text-align:right;font-size:12px">{s['大戶400張以上%'] or '—'}<br>{s['中實戶50~400張%'] or '—'}<br>{s['散戶50張以下%'] or '—'}</td>
@@ -410,7 +555,8 @@ def make_html_summary(stocks, date_str):
     <thead><tr style="background:#f8f8f8;color:#555">
       <th style="padding:7px 6px;text-align:left">代號/名稱</th>
       <th style="padding:7px 6px;text-align:right">收盤/漲跌</th>
-      <th style="padding:7px 6px;text-align:right">52週位階/均線</th>
+      <th style="padding:7px 6px;text-align:right">52週位階</th>
+      <th style="padding:7px 6px;text-align:left">技術面標籤</th>
       <th style="padding:7px 6px;text-align:right">外資(張)</th>
       <th style="padding:7px 6px;text-align:right">投信(張)</th>
       <th style="padding:7px 6px;text-align:right">大戶%/中實戶%/散戶%</th>
