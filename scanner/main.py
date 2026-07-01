@@ -355,18 +355,24 @@ def build_full_data(n_days=6):
     print(f"⏳ 抓取近 {n_days} 個交易日資料：{trading_days[:3]}...")
 
     daily_inst = {}
+    cutoff = (datetime.today() - timedelta(days=30)).strftime("%Y%m%d")
     for i, d in enumerate(trading_days):
         df, du = fetch_institutional(d)
         if df is not None:
-            daily_inst[du or d] = df
-            print(f"  ✅ {du or d} 三大法人 OK（{len(df)} 筆）")
+            actual_date = du or d
+            if actual_date < cutoff:
+                print(f"  ⚠️  {actual_date} 日期異常（TWSE 回傳舊資料），跳過")
+                time.sleep(1.5)
+                continue
+            daily_inst[actual_date] = df
+            print(f"  ✅ {actual_date} 三大法人 OK（{len(df)} 筆）")
         else:
             print(f"  ⚠️  {d} 無資料")
         time.sleep(1.5)
 
     if not daily_inst:
         print("❌ 無法取得任何三大法人資料")
-        return None, None
+        return None, None, {}
 
     today_key   = sorted(daily_inst.keys())[-1]
     date_used   = today_key
@@ -535,7 +541,7 @@ def build_full_data(n_days=6):
         if (i+1) % 10 == 0:
             print(f"  進度：{i+1}/{len(stocks)}")
 
-    return stocks, date_used
+    return stocks, date_used, daily_inst
 
 
 # ════════════════════════════════════════════════════════
@@ -979,7 +985,7 @@ def main():
     yesterday_stocks, yesterday_date = load_yesterday_stocks(docs_dir)
 
     # 抓今日資料
-    stocks, date_used = build_full_data(n_days=6)
+    stocks, date_used, daily_inst = build_full_data(n_days=6)
     if not stocks:
         print("❌ 無資料，結束。")
         return
@@ -992,6 +998,7 @@ def main():
 
     # 建立三大法人 map（供持股追蹤用）
     today_inst_map = {}
+    today_key = date_used
     today_inst_df = daily_inst.get(today_key)
     if today_inst_df is not None:
         for _, row in today_inst_df.iterrows():
