@@ -1,473 +1,258 @@
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-import os
-import time
 import csv
 import io
+import json
+import os
 import sys
+import time
+from datetime import datetime, timedelta
+
+import pandas as pd
+import requests
+
 sys.path.insert(0, os.path.dirname(__file__))
 from holdings import HOLDINGS
 
-# ── 設定 ──────────────────────────────────────────────
-SENDER_EMAIL   = os.environ["GMAIL_USER"]
-RECEIVER_EMAIL = os.environ["GMAIL_TO"]
-GMAIL_APP_PWD  = os.environ["GMAIL_APP_PWD"]
-FUGLE_API_KEY  = os.environ.get("FUGLE_API_KEY", "")
-GITHUB_REPO    = os.environ.get("GITHUB_REPOSITORY", "")  # 例如 YiyunLai/stocking，GitHub Actions 自動帶入
-# GitHub Pages 網址格式：https://{user}.github.io/{repo}/
-if GITHUB_REPO and "/" in GITHUB_REPO:
-    _owner, _repo = GITHUB_REPO.split("/")
-    PAGES_BASE_URL = f"https://{_owner}.github.io/{_repo}"
-else:
-    PAGES_BASE_URL = ""
-# ──────────────────────────────────────────────────────
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+FUGLE_API_KEY = os.environ.get("FUGLE_API_KEY", "")
 FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock"
 FUGLE_HEADERS = {"X-API-KEY": FUGLE_API_KEY}
 
 
-# ════════════════════════════════════════════════════════
-# TWSE：三大法人 + 當日股價（免費公開）
-# ════════════════════════════════════════════════════════
-
-def get_trading_days(n=10):
-    days = []
-    d = datetime.today()
-    while len(days) < n:
-        if d.weekday() < 5:
-            days.append(d.strftime("%Y%m%d"))
-        d -= timedelta(days=1)
-    return days
-
-def fetch_institutional(date_str):
-    url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
-           f"?response=json&date={date_str}&selectType=ALL")
+def parse_int(v):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        data = r.json()
-        if data.get("stat") != "OK" or not data.get("data"):
-            print(f"    （{date_str} stat={data.get('stat')}，data筆數={len(data.get('data',[]))}）")
-            return None, None
-        date_used = data.get("date", date_str)
-        return pd.DataFrame(data["data"], columns=data["fields"]), date_used
-    except Exception as e:
-        print(f"    （{date_str} 例外：{e}）")
-        return None, None
-
-def fetch_price(date_str):
-    url = (f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
-           f"?response=json&date={date_str}&type=ALL")
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        data = r.json()
-    except Exception as e:
-        print(f"  ⚠️ fetch_price 例外：{e}")
-        return {}
-
-    if data.get("stat") != "OK":
-        print(f"  ⚠️ fetch_price stat 異常：{data.get('stat')}")
-        return {}
-
-    tables = data.get("tables", [])
-    print(f"  ℹ️ fetch_price 共有 {len(tables)} 個 table")
-
-    price_map = {}
-    for idx, table in enumerate(tables):
-        if not isinstance(table, dict):
-            continue
-        fields = table.get("fields", [])
-        rows   = table.get("data", [])
-        if "收盤價" not in fields:
-            continue
-        print(f"  ℹ️ table[{idx}] 命中「收盤價」欄位，共 {len(rows)} 列，標題：{table.get('title','')[:30]}")
-        ci = fields.index("證券代號")
-        ni = fields.index("證券名稱")
-        pi = fields.index("收盤價")
-        di = fields.index("漲跌價差")
-        for row in rows:
-            code = row[ci].strip()
-            name = row[ni].strip()
-            try:
-                price = float(row[pi].replace(",","").replace("--","").strip() or 0)
-                chg   = float(row[di].replace(",","").replace("--","").strip() or 0)
-            except (ValueError, AttributeError, IndexError):
-                continue
-            if price > 0:
-                chg_pct = chg / (price - chg) * 100 if (price - chg) != 0 else 0
-                price_map[code] = {"name": name, "price": price, "chg": chg, "chg_pct": chg_pct}
-    print(f"  ℹ️ fetch_price 最終取得 {len(price_map)} 檔股價")
-    return price_map
-
-def parse_int(s):
-    try:
-        return int(str(s).replace(",", ""))
-    except:
+        return int(str(v).replace(",", "").replace("--", "0").strip() or 0)
+    except Exception:
         return 0
 
-def normalize_col_name(col):
-    """統一欄位名稱：移除空白與全形空白，降低 TWSE 欄位名稱變動造成抓不到的機率。"""
+
+def parse_float(v):
+    try:
+        return float(str(v).replace(",", "").replace("--", "0").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def norm(col):
     return str(col).replace(" ", "").replace("　", "").strip()
 
-def get_value_by_keywords(row, keywords):
-    """
-    依關鍵字搜尋欄位值。
-    例如 TWSE 欄位可能出現「外陸資買進股數(不含外資自營商)」，
-    不應只用完全相等的欄位名稱，否則很容易抓成 0。
-    """
+
+def pick(row, keywords):
     for col in row.index:
-        col_text = normalize_col_name(col)
-        if all(k in col_text for k in keywords):
+        if all(k in norm(col) for k in keywords):
             return parse_int(row.get(col, 0))
     return 0
 
-def calc_net(row, buy_keywords, sell_keywords, net_keywords=None):
-    """
-    優先抓「買賣超」欄位；若沒有，再用買進 - 賣出計算。
-    回傳單位：張。
-    """
-    if net_keywords:
-        net = get_value_by_keywords(row, net_keywords)
-        if net != 0:
-            return net // 1000
 
-    buy = get_value_by_keywords(row, buy_keywords)
-    sell = get_value_by_keywords(row, sell_keywords)
-    return (buy - sell) // 1000
+def net_lots(row, buy_kw, sell_kw, net_kw):
+    net = pick(row, net_kw)
+    if net:
+        return net // 1000
+    return (pick(row, buy_kw) - pick(row, sell_kw)) // 1000
+
 
 def calc_institutional_row(row):
-    """解析單列三大法人資料，回傳外資、投信、自營商買賣超張數。"""
-    foreign = calc_net(
-        row,
-        buy_keywords=["外陸資", "買進"],
-        sell_keywords=["外陸資", "賣出"],
-        net_keywords=["外陸資", "買賣超"],
-    )
-    trust = calc_net(
-        row,
-        buy_keywords=["投信", "買進"],
-        sell_keywords=["投信", "賣出"],
-        net_keywords=["投信", "買賣超"],
-    )
-    dealer = calc_net(
-        row,
-        buy_keywords=["自營商", "買進"],
-        sell_keywords=["自營商", "賣出"],
-        net_keywords=["自營商", "買賣超"],
-    )
+    foreign = net_lots(row, ["外陸資", "買進"], ["外陸資", "賣出"], ["外陸資", "買賣超"])
+    trust = net_lots(row, ["投信", "買進"], ["投信", "賣出"], ["投信", "買賣超"])
+    dealer = net_lots(row, ["自營商", "買進"], ["自營商", "賣出"], ["自營商", "買賣超"])
     return foreign, trust, dealer
 
 
-# ════════════════════════════════════════════════════════
-# TWSE：股權分散表（大戶/中實戶/散戶）
-# ════════════════════════════════════════════════════════
+def get_trading_days(n=10):
+    out = []
+    d = datetime.today()
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.strftime("%Y%m%d"))
+        d -= timedelta(days=1)
+    return out
 
-def fetch_ownership_distribution(code):
-    url = f"https://www.twse.com.tw/rwd/zh/stockHolder/SHAREHOLDING?response=json&stockNo={code}"
+
+def fetch_institutional(date_str):
+    url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={date_str}&selectType=ALL"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        data = r.json()
-        if data.get("stat") != "OK":
-            return None
-        rows   = data.get("data", [])
-        fields = data.get("fields", [])
-        if not rows:
-            return None
+        data = requests.get(url, headers=HEADERS, timeout=20).json()
+        if data.get("stat") != "OK" or not data.get("data"):
+            print(f"  ⚠️ {date_str} 三大法人無資料：{data.get('stat')}")
+            return None, None
+        return pd.DataFrame(data["data"], columns=data["fields"]), data.get("date", date_str)
+    except Exception as e:
+        print(f"  ⚠️ {date_str} 三大法人例外：{e}")
+        return None, None
 
-        pct_idx = None
-        for i, f in enumerate(fields):
-            if "%" in f or "比例" in f or "占" in f:
-                pct_idx = i
-                break
-        if pct_idx is None and len(fields) >= 4:
-            pct_idx = 3
 
-        big, mid, small = 0.0, 0.0, 0.0
+def fetch_price(date_str):
+    url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date={date_str}&type=ALL"
+    try:
+        data = requests.get(url, headers=HEADERS, timeout=20).json()
+    except Exception as e:
+        print(f"  ⚠️ 股價例外：{e}")
+        return {}
+
+    if data.get("stat") != "OK":
+        print(f"  ⚠️ 股價 stat 異常：{data.get('stat')}")
+        return {}
+
+    price_map = {}
+    for table in data.get("tables", []):
+        fields = table.get("fields", []) if isinstance(table, dict) else []
+        rows = table.get("data", []) if isinstance(table, dict) else []
+        needed = ["證券代號", "證券名稱", "收盤價", "漲跌價差"]
+        if not all(x in fields for x in needed):
+            continue
+        ci, ni, pi, di = [fields.index(x) for x in needed]
         for row in rows:
-            label = str(row[0]).replace(",", "").strip()
-            try:
-                pct = float(str(row[pct_idx]).replace(",", "").replace("%", "").strip())
-            except:
+            code = str(row[ci]).strip()
+            if len(code) != 4:
                 continue
-            if any(x in label for x in ["400", "600", "800", "1,000", "1000", "以上"]):
-                big += pct
-            elif any(x in label for x in ["1～", "1~", "~5", "5～", "10～", "15～", "20～", "30～", "40～",
-                                            "1至", "5至", "10至", "15至", "20至", "30至", "40至"]):
-                small += pct
-            elif any(x in label for x in ["50", "100", "200"]):
-                mid += pct
+            price = parse_float(row[pi])
+            chg = parse_float(row[di])
+            if price <= 0:
+                continue
+            price_map[code] = {
+                "name": str(row[ni]).strip(),
+                "price": price,
+                "chg": chg,
+                "chg_pct": chg / (price - chg) * 100 if price != chg else 0,
+            }
+    print(f"✅ 股價取得 {len(price_map)} 檔")
+    return price_map
 
-        return {"大戶400張以上%": round(big, 2),
-                "中實戶50~400張%": round(mid, 2),
-                "散戶50張以下%": round(small, 2)}
-    except:
-        return None
-
-
-# ════════════════════════════════════════════════════════
-# 富果 API：52週區間、均線（技術面）
-# ════════════════════════════════════════════════════════
 
 def fugle_get(path, params=None):
     if not FUGLE_API_KEY:
         return None
     try:
         r = requests.get(f"{FUGLE_BASE}{path}", headers=FUGLE_HEADERS, params=params or {}, timeout=15)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except:
+        return r.json() if r.status_code == 200 else None
+    except Exception:
         return None
 
-def fetch_52w_stats(code):
-    """取得 52 週高低點，計算目前股價在區間的百分位"""
-    data = fugle_get(f"/historical/stats/{code}")
-    if not data:
-        return None
-    try:
-        high = data.get("week52High")
-        low  = data.get("week52Low")
-        close = data.get("closePrice")
-        if not high or not low or high == low:
-            return None
-        percentile = (close - low) / (high - low) * 100
-        return {
-            "52週高": high,
-            "52週低": low,
-            "52週位階%": round(percentile, 1),
-        }
-    except:
-        return None
 
 def fetch_candles(code, days=130):
-    """抓歷史日K（OHLCV），免費方案可用，一次呼叫取得完整序列"""
     today = datetime.today()
-    date_from = (today - timedelta(days=days)).strftime("%Y-%m-%d")
-    date_to   = today.strftime("%Y-%m-%d")
     data = fugle_get(f"/historical/candles/{code}", {
-        "from": date_from, "to": date_to, "timeframe": "D",
-        "fields": "open,high,low,close,volume", "sort": "asc"
+        "from": (today - timedelta(days=days)).strftime("%Y-%m-%d"),
+        "to": today.strftime("%Y-%m-%d"),
+        "timeframe": "D",
+        "fields": "open,high,low,close,volume",
+        "sort": "asc",
     })
-    if not data or not data.get("data"):
-        return None
-    series = data["data"]
-    if len(series) < 25:
-        return None
-    return series  # list of {date, open, high, low, close, volume}, 由舊到新排序
+    rows = data.get("data", []) if data else []
+    return rows if len(rows) >= 25 else None
 
-def compute_sma(closes, period):
-    if len(closes) < period:
-        return None
-    return sum(closes[-period:]) / period
 
-def compute_sma_series(closes, period):
-    if len(closes) < period:
+def sma(values, n):
+    return sum(values[-n:]) / n if len(values) >= n else None
+
+
+def ema(values, n):
+    if len(values) < n:
         return []
-    return [sum(closes[i-period+1:i+1]) / period for i in range(period-1, len(closes))]
+    k = 2 / (n + 1)
+    out = [sum(values[:n]) / n]
+    for v in values[n:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
 
-def compute_kdj(candles, r_period=9, k_period=3, d_period=3):
-    """RSV → K → D，回傳最後兩筆 K/D 供判斷黃金交叉"""
-    if len(candles) < r_period + d_period:
-        return None
-    closes = [c["close"] for c in candles]
-    highs  = [c["high"]  for c in candles]
-    lows   = [c["low"]   for c in candles]
 
-    k_vals, d_vals = [], []
-    k_prev, d_prev = 50.0, 50.0
-    for i in range(len(candles)):
-        if i < r_period - 1:
-            k_vals.append(None); d_vals.append(None)
-            continue
-        period_high = max(highs[i-r_period+1:i+1])
-        period_low  = min(lows[i-r_period+1:i+1])
-        rsv = 50.0 if period_high == period_low else (closes[i] - period_low) / (period_high - period_low) * 100
-        k = (2/3)*k_prev + (1/3)*rsv
-        d = (2/3)*d_prev + (1/3)*k
-        k = max(0, min(100, k))
-        d = max(0, min(100, d))
-        k_vals.append(k); d_vals.append(d)
-        k_prev, d_prev = k, d
-
-    valid = [(k,d) for k,d in zip(k_vals, d_vals) if k is not None]
-    if len(valid) < 2:
-        return None
-    (pk, pd_), (ck, cd) = valid[-2], valid[-1]
-    golden_cross = (pk <= pd_) and (ck > cd)
-    return {"K值": round(ck,1), "D值": round(cd,1), "KD黃金交叉": "是" if golden_cross else "否"}
-
-def compute_ema_series(values, period):
-    if len(values) < period:
-        return []
-    k = 2 / (period + 1)
-    ema = [sum(values[:period]) / period]
-    for v in values[period:]:
-        ema.append(v * k + ema[-1] * (1 - k))
-    return ema
-
-def compute_macd(candles, fast=12, slow=26, signal=9):
-    closes = [c["close"] for c in candles]
-    if len(closes) < slow + signal:
-        return None
-    ema_fast = compute_ema_series(closes, fast)
-    ema_slow = compute_ema_series(closes, slow)
-    offset = len(ema_fast) - len(ema_slow)
-    macd_line = [f - s for f, s in zip(ema_fast[offset:], ema_slow)]
-    if len(macd_line) < signal + 1:
-        return None
-    signal_line = compute_ema_series(macd_line, signal)
-    macd_aligned = macd_line[-len(signal_line):]
-    hist = [m - s for m, s in zip(macd_aligned, signal_line)]
-    if len(hist) < 2:
-        return None
-    prev_hist, curr_hist = hist[-2], hist[-1]
-    macd_turn_bullish = (prev_hist <= 0) and (curr_hist > 0)
-    return {"MACD翻多": "是" if macd_turn_bullish else "否"}
-
-def compute_bbands(closes, period=20, num_std=2):
-    if len(closes) < period:
-        return None
-    window = closes[-period:]
-    mean = sum(window) / period
-    variance = sum((x - mean) ** 2 for x in window) / period
-    std = variance ** 0.5
-    upper = mean + num_std * std
-    return {"布林上軌": round(upper, 2)}
-
-def analyze_technical(code, today_chg_pct, today_volume=None):
-    """一次抓K線、自算全部技術面指標，回傳 5 個訊號標籤"""
+def analyze_technical(code, chg_pct):
     candles = fetch_candles(code)
     if not candles:
         return None
 
-    closes  = [c["close"]  for c in candles]
-    volumes = [c["volume"] for c in candles]
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    vols = [c["volume"] for c in candles]
 
-    ma5  = compute_sma(closes, 5)
-    ma20 = compute_sma(closes, 20)
-    ma60 = compute_sma(closes, 60)
-    ma20_series = compute_sma_series(closes, 20)
-
-    result = {
-        "MA5": round(ma5,2) if ma5 else "",
-        "MA20": round(ma20,2) if ma20 else "",
-        "MA60": round(ma60,2) if ma60 else "",
-        "均線多頭": "否", "MA20翻揚": "否",
-        "KD黃金交叉": "否", "MACD翻多": "否", "布林突破": "否", "爆量長紅": "否",
+    ma5, ma20, ma60 = sma(closes, 5), sma(closes, 20), sma(closes, 60)
+    out = {
+        "MA5": round(ma5, 2) if ma5 else "",
+        "MA20": round(ma20, 2) if ma20 else "",
+        "MA60": round(ma60, 2) if ma60 else "",
+        "均線多頭": "是" if ma5 and ma20 and ma60 and ma5 > ma20 > ma60 else "否",
+        "MA20翻揚": "否",
+        "KD黃金交叉": "否",
+        "MACD翻多": "否",
+        "布林突破": "否",
+        "爆量長紅": "否",
+        "_candles": [{"date": c["date"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]} for c in candles[-60:]],
     }
 
-    if ma5 and ma20 and ma60:
-        result["均線多頭"] = "是" if (ma5 > ma20 > ma60) else "否"
-    if len(ma20_series) >= 5:
-        result["MA20翻揚"] = "是" if ma20_series[-1] > ma20_series[-5] else "否"
+    if len(closes) >= 24:
+        out["MA20翻揚"] = "是" if sum(closes[-20:]) / 20 > sum(closes[-24:-4]) / 20 else "否"
 
-    kd = compute_kdj(candles)
-    if kd:
-        result["KD黃金交叉"] = kd["KD黃金交叉"]
+    if len(closes) >= 20:
+        win = closes[-20:]
+        mean = sum(win) / 20
+        std = (sum((x - mean) ** 2 for x in win) / 20) ** 0.5
+        out["布林突破"] = "是" if closes[-1] > mean + 2 * std else "否"
 
-    macd = compute_macd(candles)
-    if macd:
-        result["MACD翻多"] = macd["MACD翻多"]
+    if len(closes) >= 35:
+        e12, e26 = ema(closes, 12), ema(closes, 26)
+        macd = [a - b for a, b in zip(e12[len(e12)-len(e26):], e26)]
+        sig = ema(macd, 9)
+        if len(sig) >= 2:
+            hist = [m - s for m, s in zip(macd[-len(sig):], sig)]
+            out["MACD翻多"] = "是" if hist[-2] <= 0 < hist[-1] else "否"
 
-    bb = compute_bbands(closes)
-    if bb and closes:
-        result["布林突破"] = "是" if closes[-1] > bb["布林上軌"] else "否"
-        result["布林上軌"] = bb["布林上軌"]
+    if len(candles) >= 12:
+        k_prev = d_prev = 50.0
+        kd = []
+        for i in range(len(candles)):
+            if i < 8:
+                continue
+            hh, ll = max(highs[i-8:i+1]), min(lows[i-8:i+1])
+            rsv = 50 if hh == ll else (closes[i] - ll) / (hh - ll) * 100
+            k = (2/3) * k_prev + (1/3) * rsv
+            d = (2/3) * d_prev + (1/3) * k
+            kd.append((k, d))
+            k_prev, d_prev = k, d
+        if len(kd) >= 2:
+            out["KD黃金交叉"] = "是" if kd[-2][0] <= kd[-2][1] and kd[-1][0] > kd[-1][1] else "否"
 
-    # 爆量長紅：今日量 > 近5日均量的1.5倍，且漲幅>=3%
-    if len(volumes) >= 6:
-        avg_vol5 = sum(volumes[-6:-1]) / 5
-        vol_today = volumes[-1]
-        vol_spike = avg_vol5 > 0 and vol_today > avg_vol5 * 1.5
-        result["爆量長紅"] = "是" if (vol_spike and today_chg_pct >= 3) else "否"
-    else:
-        result["爆量長紅"] = "是" if today_chg_pct >= 5 else "否"
+    if len(vols) >= 6:
+        avg5 = sum(vols[-6:-1]) / 5
+        out["爆量長紅"] = "是" if avg5 > 0 and vols[-1] > avg5 * 1.5 and chg_pct >= 3 else "否"
+    return out
 
-    # 保留近 60 天 K 線供畫圖用（只取必要欄位精簡資料量）
-    result["_candles"] = [
-        {"date": c["date"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]}
-        for c in candles[-60:]
-    ]
-
-    return result
-
-
-# ════════════════════════════════════════════════════════
-# 主流程
-# ════════════════════════════════════════════════════════
 
 def build_full_data(n_days=6):
-    trading_days = get_trading_days(n_days)
-    print(f"⏳ 抓取近 {n_days} 個交易日資料：{trading_days[:3]}...")
-
     daily_inst = {}
     cutoff = (datetime.today() - timedelta(days=30)).strftime("%Y%m%d")
-    for i, d in enumerate(trading_days):
-        df, du = fetch_institutional(d)
-        if df is not None:
-            actual_date = du or d
-            if actual_date < cutoff:
-                print(f"  ⚠️  {actual_date} 日期異常（TWSE 回傳舊資料），跳過")
-                time.sleep(1.5)
-                continue
-            daily_inst[actual_date] = df
-            print(f"  ✅ {actual_date} 三大法人 OK（{len(df)} 筆）")
-        else:
-            print(f"  ⚠️  {d} 無資料")
-        time.sleep(1.5)
+
+    for d in get_trading_days(n_days):
+        df, actual = fetch_institutional(d)
+        if df is not None and actual >= cutoff:
+            daily_inst[actual] = df
+            print(f"✅ {actual} 三大法人 OK（{len(df)} 筆）")
+        time.sleep(1.2)
 
     if not daily_inst:
-        print("❌ 無法取得任何三大法人資料")
         return None, None, {}
 
-    today_key   = sorted(daily_inst.keys())[-1]
-    date_used   = today_key
-    today_df    = daily_inst[today_key]
+    date_used = sorted(daily_inst.keys())[-1]
     sorted_days = sorted(daily_inst.keys(), reverse=True)
-
-    time.sleep(1)
     price_map = fetch_price(date_used)
-    print(f"✅ 今日股價 {date_used}：{len(price_map)} 筆")
 
     inst_history = {}
-    _fields_printed = False
-    for day_key, df in daily_inst.items():
-        if not _fields_printed:
-            print(f"  ℹ️ T86 欄位：{list(df.columns)}")
-            _fields_printed = True
+    for day, df in daily_inst.items():
+        print(f"ℹ️ {day} 欄位：{list(df.columns)}")
         for _, row in df.iterrows():
-            code = str(row.get("證券代號","")).strip()
+            code = str(row.get("證券代號", "")).strip()
             if len(code) != 4:
                 continue
-            f, t, d2 = calc_institutional_row(row)
-            inst_history.setdefault(code, {})[day_key] = {"f": f, "t": t, "d": d2}
+            f, t, d = calc_institutional_row(row)
+            inst_history.setdefault(code, {})[day] = {"f": f, "t": t, "d": d}
 
     stocks = []
-    for _, row in today_df.iterrows():
-        code = str(row.get("證券代號","")).strip()
-        if len(code) != 4:
-            continue
-        pd_info = price_map.get(code)
-        if not pd_info:
+    for _, row in daily_inst[date_used].iterrows():
+        code = str(row.get("證券代號", "")).strip()
+        if len(code) != 4 or code not in price_map:
             continue
 
         hist = inst_history.get(code, {})
-        today_data = hist.get(today_key, {"f":0,"t":0,"d":0})
-        foreign_today = today_data["f"]
-        trust_today   = today_data["t"]
-        dealer_today  = today_data["d"]
-
-        # debug：印出前5檔的外資/投信數值
-        if len(stocks) < 5:
-            print(f"  DEBUG {code}: foreign={foreign_today}, trust={trust_today}")
-
-        # 連買天數（先算，用來當篩選條件）
+        today = hist.get(date_used, {"f": 0, "t": 0, "d": 0})
         f_consec = 0
         for day in sorted_days:
             if hist.get(day, {}).get("f", 0) > 0:
@@ -482,280 +267,261 @@ def build_full_data(n_days=6):
             else:
                 break
 
-        # 篩選條件：外資連買 ≥ 1天，OR 投信連買 ≥ 1天
         if f_consec == 0 and t_consec == 0:
             continue
 
-        # 籌碼分組標籤
-        if f_consec >= 1 and t_consec >= 1:
-            chip_type = "雙主力連買"
-        elif f_consec >= 1:
-            chip_type = "外資連買"
-        else:
-            chip_type = "投信連買"
-
-        five_days = sorted_days[:5]
-        f_5d = sum(hist.get(d,{}).get("f",0) for d in five_days)
-        t_5d = sum(hist.get(d,{}).get("t",0) for d in five_days)
-        d_5d = sum(hist.get(d,{}).get("d",0) for d in five_days)
-
+        p = price_map[code]
+        chip_type = "雙主力連買" if f_consec and t_consec else ("外資連買" if f_consec else "投信連買")
+        five = sorted_days[:5]
         stocks.append({
             "代號": code,
-            "名稱": pd_info["name"],
-            "類型": "",        # 技術面分類（低位啟動/強勢噴出/趨勢持續）
-            "籌碼類型": chip_type,  # 外資連買/投信連買/雙主力連買
-            "收盤價": pd_info["price"],
-            "漲跌%": round(pd_info["chg_pct"], 2),
-            "外資今日(張)": foreign_today,
-            "投信今日(張)": trust_today,
-            "自營今日(張)": dealer_today,
-            "三大法人合計(張)": foreign_today + trust_today + dealer_today,
+            "名稱": p["name"],
+            "類型": "",
+            "籌碼類型": chip_type,
+            "收盤價": p["price"],
+            "漲跌%": round(p["chg_pct"], 2),
+            "外資今日(張)": today["f"],
+            "投信今日(張)": today["t"],
+            "自營今日(張)": today["d"],
+            "三大法人合計(張)": today["f"] + today["t"] + today["d"],
             "外資連買天數": f_consec,
             "投信連買天數": t_consec,
-            "外資5日累計(張)": f_5d,
-            "投信5日累計(張)": t_5d,
-            "自營5日累計(張)": d_5d,
-            "52週高": "", "52週低": "", "52週位階%": "",
+            "外資5日累計(張)": sum(hist.get(x, {}).get("f", 0) for x in five),
+            "投信5日累計(張)": sum(hist.get(x, {}).get("t", 0) for x in five),
+            "自營5日累計(張)": sum(hist.get(x, {}).get("d", 0) for x in five),
             "MA5": "", "MA20": "", "MA60": "",
-            "均線多頭": "", "MA20翻揚": "",
-            "KD黃金交叉": "", "MACD翻多": "", "布林突破": "", "爆量長紅": "",
-            "技術面標籤": "",
-            "大戶400張以上%": "", "中實戶50~400張%": "", "散戶50張以下%": "",
+            "均線多頭": "", "MA20翻揚": "", "KD黃金交叉": "", "MACD翻多": "", "布林突破": "", "爆量長紅": "",
+            "技術面標籤": "", "大戶400張以上%": "", "中實戶50~400張%": "", "散戶50張以下%": "",
             "_candles": [],
         })
 
-    chip_order = {"雙主力連買": 0, "外資連買": 1, "投信連買": 2}
-    stocks.sort(key=lambda x: (
-        chip_order.get(x["籌碼類型"], 9),
-        -(x["外資連買天數"] + x["投信連買天數"])
-    ))
-
-    # 技術面 + 股權分散逐檔補齊
-    has_fugle = bool(FUGLE_API_KEY)
-    print(f"\n📊 開始補齊 {len(stocks)} 檔技術面 / 籌碼面資料（富果 API：{'啟用' if has_fugle else '未設定，跳過技術面'}）...")
-
+    print(f"📊 補技術面：{len(stocks)} 檔")
     for i, s in enumerate(stocks):
-        code = s["代號"]
-
-        if has_fugle:
-            stats = fetch_52w_stats(code)
-            if stats:
-                s["52週高"]    = stats["52週高"]
-                s["52週低"]    = stats["52週低"]
-                s["52週位階%"] = stats["52週位階%"]
-            time.sleep(0.3)
-
-            tech = analyze_technical(code, s["漲跌%"])
+        if FUGLE_API_KEY:
+            tech = analyze_technical(s["代號"], s["漲跌%"])
             if tech:
-                s["MA5"]        = tech["MA5"]
-                s["MA20"]       = tech["MA20"]
-                s["MA60"]       = tech["MA60"]
-                s["均線多頭"]    = tech["均線多頭"]
-                s["MA20翻揚"]   = tech["MA20翻揚"]
-                s["KD黃金交叉"] = tech["KD黃金交叉"]
-                s["MACD翻多"]   = tech["MACD翻多"]
-                s["布林突破"]   = tech["布林突破"]
-                s["爆量長紅"]   = tech["爆量長紅"]
-                s["_candles"]   = tech.get("_candles", [])
+                s.update(tech)
+            time.sleep(0.35)
 
-                tags = []
-                if tech["均線多頭"] == "是":   tags.append("均線多頭")
-                if tech["KD黃金交叉"] == "是": tags.append("KD黃金交叉")
-                if tech["MACD翻多"] == "是":   tags.append("MACD翻多")
-                if tech["布林突破"] == "是":   tags.append("布林突破")
-                if tech["爆量長紅"] == "是":   tags.append("爆量長紅")
-                s["技術面標籤"] = "、".join(tags) if tags else "—"
-            time.sleep(0.3)
-
-        own = fetch_ownership_distribution(code)
-        if own:
-            s["大戶400張以上%"]   = own["大戶400張以上%"]
-            s["中實戶50~400張%"] = own["中實戶50~400張%"]
-            s["散戶50張以下%"]   = own["散戶50張以下%"]
-        time.sleep(0.6)
-
-        # ── 分類邏輯（相對位階 + 均線 + 法人動向 + 技術面標籤數）──
-        chg_pct    = s["漲跌%"]
-        percentile = s["52週位階%"]
-        tag_count  = len([t for t in [s["均線多頭"],s["KD黃金交叉"],s["MACD翻多"],s["布林突破"],s["爆量長紅"]] if t == "是"])
-
-        if has_fugle and percentile != "":
-            if percentile >= 75 and (chg_pct > 3 or s["外資今日(張)"] > 300 or s["投信今日(張)"] > 200 or tag_count >= 3):
-                category = "強勢噴出"
-            elif percentile <= 35 and (s["均線多頭"] == "是" or s["MA20翻揚"] == "是") and (s["外資今日(張)"] > 0 or s["投信今日(張)"] > 0):
-                category = "低位啟動"
-            else:
-                category = "趨勢持續"
+        tags = [k for k in ["均線多頭", "KD黃金交叉", "MACD翻多", "布林突破", "爆量長紅"] if s.get(k) == "是"]
+        s["技術面標籤"] = "、".join(tags) if tags else "—"
+        if len(tags) >= 3 or s["漲跌%"] > 5 or s["外資今日(張)"] > 300 or s["投信今日(張)"] > 200:
+            s["類型"] = "強勢噴出"
+        elif s["漲跌%"] < 2 and (s["外資今日(張)"] > 0 or s["投信今日(張)"] > 0) and s["收盤價"] < 150:
+            s["類型"] = "低位啟動"
         else:
-            if chg_pct > 5 or (chg_pct > 3 and (s["外資今日(張)"] > 300 or s["投信今日(張)"] > 200)):
-                category = "強勢噴出"
-            elif chg_pct < 2 and (s["外資今日(張)"] > 0 or s["投信今日(張)"] > 0) and s["收盤價"] < 150:
-                category = "低位啟動"
-            else:
-                category = "趨勢持續"
+            s["類型"] = "趨勢持續"
+        if (i + 1) % 10 == 0:
+            print(f"  進度 {i+1}/{len(stocks)}")
 
-        s["類型"] = category
-
-        if (i+1) % 10 == 0:
-            print(f"  進度：{i+1}/{len(stocks)}")
-
+    order = {"雙主力連買": 0, "外資連買": 1, "投信連買": 2}
+    stocks.sort(key=lambda s: (order.get(s["籌碼類型"], 9), -(s["外資連買天數"] + s["投信連買天數"])))
     return stocks, date_used, daily_inst
 
 
-# ════════════════════════════════════════════════════════
-# 輸出：CSV + Email
-# ════════════════════════════════════════════════════════
-
-def make_csv(stocks):
-    output = io.StringIO()
-    if not stocks:
-        return output.getvalue()
-    fieldnames = [k for k in stocks[0].keys() if not k.startswith("_")]
-    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(stocks)
-    return output.getvalue()
-
 def render_mini_candlestick_svg(candles, width=260, height=110):
-    """用純 SVG 畫迷你K線圖，不依賴外部套件，Email/網頁都能直接顯示"""
     if not candles or len(candles) < 2:
         return '<div style="color:#888;font-size:11px;padding:20px;text-align:center">無K線資料</div>'
-
-    highs = [c["h"] for c in candles]
-    lows  = [c["l"] for c in candles]
+    highs, lows = [c["h"] for c in candles], [c["l"] for c in candles]
     vmax, vmin = max(highs), min(lows)
-    vrange = vmax - vmin if vmax != vmin else 1
+    vr = vmax - vmin if vmax != vmin else 1
+    cw, bw = width / len(candles), max(width / len(candles) * 0.6, 1.5)
 
-    n = len(candles)
-    candle_w = width / n
-    body_w = max(candle_w * 0.6, 1.5)
-
-    def y(price):
-        return height - ((price - vmin) / vrange) * (height - 10) - 5
+    def y(v):
+        return height - ((v - vmin) / vr) * (height - 10) - 5
 
     bars = []
     for i, c in enumerate(candles):
-        x_center = i * candle_w + candle_w / 2
-        is_up = c["c"] >= c["o"]
-        color = "#e34948" if is_up else "#1baf7a"
-        y_open, y_close = y(c["o"]), y(c["c"])
-        y_high, y_low   = y(c["h"]), y(c["l"])
-        body_top = min(y_open, y_close)
-        body_height = max(abs(y_close - y_open), 1)
-        bars.append(
-            f'<line x1="{x_center:.1f}" y1="{y_high:.1f}" x2="{x_center:.1f}" y2="{y_low:.1f}" stroke="{color}" stroke-width="1"/>'
-            f'<rect x="{x_center - body_w/2:.1f}" y="{body_top:.1f}" width="{body_w:.1f}" height="{body_height:.1f}" fill="{color}"/>'
-        )
+        x = i * cw + cw / 2
+        color = "#e34948" if c["c"] >= c["o"] else "#1baf7a"
+        yo, yc, yh, yl = y(c["o"]), y(c["c"]), y(c["h"]), y(c["l"])
+        bars.append(f'<line x1="{x:.1f}" y1="{yh:.1f}" x2="{x:.1f}" y2="{yl:.1f}" stroke="{color}" stroke-width="1"/>')
+        bars.append(f'<rect x="{x-bw/2:.1f}" y="{min(yo,yc):.1f}" width="{bw:.1f}" height="{max(abs(yc-yo),1):.1f}" fill="{color}"/>')
+    return f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="background:#1a1a1a;border-radius:6px">{"".join(bars)}</svg>'
 
-    return (
-        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="background:#1a1a1a;border-radius:6px">'
-        + "".join(bars) +
-        '</svg>'
-    )
 
-def make_report_page(stocks, date_str, review_html=""):
-    """完整版報告網頁（含K線圖），用於 GitHub Pages 發布"""
+def tech_count(s):
+    return len([x for x in ["均線多頭", "KD黃金交叉", "MACD翻多", "布林突破", "爆量長紅"] if s.get(x) == "是"])
+
+
+def filter_stocks(stocks, mode):
+    if mode == "foreign":
+        return [s for s in stocks if s["外資連買天數"] > 0 or s["外資今日(張)"] > 0 or s["外資5日累計(張)"] > 0]
+    if mode == "trust":
+        return [s for s in stocks if s["投信連買天數"] > 0 or s["投信今日(張)"] > 0 or s["投信5日累計(張)"] > 0]
+    if mode == "technical":
+        return [s for s in stocks if tech_count(s) >= 2 or s["類型"] == "強勢噴出"]
+    return stocks
+
+
+def stock_cards(group):
+    cards = ""
+    for s in group:
+        chg_color = "#e34948" if s["漲跌%"] >= 0 else "#1baf7a"
+        sign = "+" if s["漲跌%"] >= 0 else ""
+        tags = "".join([f'<span style="font-size:10px;padding:2px 6px;border-radius:10px;background:#eee;color:#555">{k}</span>' for k in ["均線多頭", "KD黃金交叉", "MACD翻多", "布林突破", "爆量長紅"] if s.get(k) == "是"]) or '<span style="font-size:10px;color:#aaa">—</span>'
+        cards += f"""
+<div style="background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
+  <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:8px">
+    <div><div style="font-size:15px;font-weight:600">{s['代號']} {s['名稱']}</div><div style="font-size:12px;color:#888">{s['籌碼類型']} · 外資連{s['外資連買天數']}天｜投信連{s['投信連買天數']}天</div></div>
+    <div style="text-align:right"><div style="font-size:17px;font-weight:600">{s['收盤價']:.2f}</div><div style="font-size:12px;color:{chg_color}">{sign}{s['漲跌%']:.2f}%</div></div>
+  </div>
+  <div style="margin-bottom:8px">{render_mini_candlestick_svg(s.get('_candles', []))}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px">{tags}</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:11px;text-align:center;background:#f8f8f8;border-radius:8px;padding:6px 0">
+    <div><div style="color:#999">外今</div><b>{s['外資今日(張)']:+,}</b></div>
+    <div><div style="color:#999">外5日</div><b>{s['外資5日累計(張)']:+,}</b></div>
+    <div><div style="color:#999">投今</div><b>{s['投信今日(張)']:+,}</b></div>
+    <div><div style="color:#999">投5日</div><b>{s['投信5日累計(張)']:+,}</b></div>
+  </div>
+</div>"""
+    return cards
+
+
+def make_dashboard_page(stocks, date_str, mode):
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
-    cats = ["雙主力連買", "外資連買", "投信連買"]
-    cat_desc = {
-        "雙主力連買": ("⭐", "雙主力連買", "外資 + 投信同時連續買超，最強籌碼訊號"),
-        "外資連買":   ("🔵", "外資連買",   "外資連續買超，法人主導明確"),
-        "投信連買":   ("🟣", "投信連買",   "投信連續買超，通常伴隨題材或基本面邏輯"),
+    cfg = {
+        "foreign": ("🔵", "外資連買", "外資連續買超、當日外資買超或 5 日外資累計偏多"),
+        "trust": ("🟣", "投信連買", "投信連續買超、當日投信買超或 5 日投信累計偏多"),
+        "technical": ("🔥", "技術面很強", "至少兩個技術訊號成立，或分類為強勢噴出"),
+        "report": ("📊", "台股籌碼日報", "外資、投信與技術面綜合清單"),
     }
+    emoji, title, desc = cfg[mode]
+    group = filter_stocks(stocks, mode)
+    if mode == "foreign":
+        group.sort(key=lambda s: (-s["外資連買天數"], -s["外資5日累計(張)"], -s["漲跌%"]))
+    elif mode == "trust":
+        group.sort(key=lambda s: (-s["投信連買天數"], -s["投信5日累計(張)"], -s["漲跌%"]))
+    elif mode == "technical":
+        group.sort(key=lambda s: (-tech_count(s), -s["漲跌%"]))
 
-    def tag_html(label, active):
-        color = {
-            "均線多頭": "#4dabf7", "KD黃金交叉": "#51cf66",
-            "MACD翻多": "#ff8787", "布林突破": "#cc5de8", "爆量長紅": "#ffa94d",
-        }.get(label, "#888")
-        opacity = "1" if active else "0.25"
-        return f'<span style="font-size:10px;padding:2px 6px;border-radius:10px;background:{color}33;color:{color};border:1px solid {color}66;opacity:{opacity};white-space:nowrap">{label}</span>'
-
-    cards_by_cat = {}
-    for cat in cats:
-        group = [s for s in stocks if s["籌碼類型"] == cat]
-        cards = ""
-        for s in group:
-            chg_color = "#e34948" if s["漲跌%"] >= 0 else "#1baf7a"
-            chg_sign  = "+" if s["漲跌%"] >= 0 else ""
-            chart_svg = render_mini_candlestick_svg(s.get("_candles", []))
-
-            chip_colors = {
-                "雙主力連買": ("#fff3cd", "#856404", "⭐"),
-                "外資連買":   ("#d1ecf1", "#0c5460", "🔵"),
-                "投信連買":   ("#e8d5f5", "#6f42c1", "🟣"),
-            }
-            chip_bg, chip_fg, chip_icon = chip_colors.get(s["籌碼類型"], ("#f0f0f0","#555",""))
-            chip_badge = f'<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:{chip_bg};color:{chip_fg};font-weight:600">{chip_icon} {s["籌碼類型"]}</span>'
-            consec_label = f'外資連{s["外資連買天數"]}天' if s["外資連買天數"] > 0 else ""
-            if s["投信連買天數"] > 0:
-                consec_label += f'{"｜" if consec_label else ""}投信連{s["投信連買天數"]}天'
-
-            tags_html = "".join([
-                tag_html("均線多頭", s["均線多頭"]=="是"),
-                tag_html("KD黃金交叉", s["KD黃金交叉"]=="是"),
-                tag_html("MACD翻多", s["MACD翻多"]=="是"),
-                tag_html("布林突破", s["布林突破"]=="是"),
-                tag_html("爆量長紅", s["爆量長紅"]=="是"),
-            ])
-
-            pct_label = f'{s["52週位階%"]}%' if s["52週位階%"] != "" else "—"
-
-            cards += f"""
-            <div style="background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
-                <div>
-                  <div style="font-size:15px;font-weight:600">{s['代號']} {s['名稱']}</div>
-                  <div style="font-size:12px;color:#888;margin-top:2px">{chip_badge} <span style="color:#aaa">{consec_label}</span></div>
-                </div>
-                <div style="text-align:right">
-                  <div style="font-size:17px;font-weight:600">{s['收盤價']:.2f}</div>
-                  <div style="font-size:12px;color:{chg_color}">{chg_sign}{s['漲跌%']:.2f}%</div>
-                </div>
-              </div>
-              <div style="margin-bottom:8px">{chart_svg}</div>
-              <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px">{tags_html}</div>
-              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:11px;text-align:center;background:#f8f8f8;border-radius:8px;padding:6px 0">
-                <div><div style="color:#999">外資</div><div style="font-weight:500">{s['外資今日(張)']:+,}</div><div style="color:#aaa">連{s['外資連買天數']}天</div></div>
-                <div><div style="color:#999">投信</div><div style="font-weight:500">{s['投信今日(張)']:+,}</div><div style="color:#aaa">連{s['投信連買天數']}天</div></div>
-                <div><div style="color:#999">大戶%</div><div style="font-weight:500">{s['大戶400張以上%'] or '—'}</div></div>
-              </div>
-            </div>"""
-        cards_by_cat[cat] = (cards, len(group))
-
-    sections = ""
-    for cat in cats:
-        emoji, label, desc = cat_desc[cat]
-        cards, count = cards_by_cat[cat]
-        if count == 0:
-            continue
-        sections += f"""
-        <section style="margin-bottom:36px">
-          <div style="font-size:18px;font-weight:700;margin-bottom:4px">{emoji} {label} <span style="font-size:13px;font-weight:400;color:#888">{count} 檔</span></div>
-          <div style="font-size:13px;color:#888;margin-bottom:14px">{desc}</div>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px">{cards}</div>
-        </section>"""
-
-    return f"""<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>台股籌碼日報 {y}/{m}/{d}</title>
-</head>
+    cards = stock_cards(group) if group else '<div style="background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:20px;color:#888">目前沒有符合條件的股票。</div>'
+    return f"""<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} {y}/{m}/{d}</title></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#1a1a1a;margin:0;padding:0">
 <div style="max-width:1100px;margin:0 auto;padding:28px 16px 60px">
-  <div style="border-bottom:2px solid #1a1a1a;padding-bottom:14px;margin-bottom:28px">
-    <div style="font-size:24px;font-weight:700">📊 台股籌碼日報</div>
-    <div style="font-size:13px;color:#888;margin-top:4px">{y}/{m}/{d} 盤後 · 共 {len(stocks)} 檔入選 · 資料來源：TWSE、富果行情 API</div>
-  </div>
-  {review_html}
-  {sections}
-  <div style="border-top:1px solid #ddd;padding-top:16px;margin-top:20px;font-size:12px;color:#aaa">
-    僅供參考，不構成投資建議 · 每日約 17:30 自動更新
-  </div>
-</div>
-</body></html>"""
+<div style="border-bottom:2px solid #1a1a1a;padding-bottom:14px;margin-bottom:24px"><div style="font-size:24px;font-weight:700">{emoji} {title}</div><div style="font-size:13px;color:#888;margin-top:4px">{y}/{m}/{d} 盤後 · {desc} · 共 {len(group)} 檔 · <a href="index.html" style="color:#888">← 回首頁</a></div></div>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px">{cards}</div>
+<div style="border-top:1px solid #ddd;padding-top:16px;margin-top:28px;font-size:12px;color:#aaa">僅供參考，不構成投資建議 · 每日約 17:30 自動更新</div>
+</div></body></html>"""
 
 
-莊為了節省回覆空間，我無法在單次工具呼叫中完整貼上整個 5 萬字元檔案內容。請改用我下一步會採用的 GitHub 小範圍 patch 流程。
+def make_holdings_page(price_map, inst_map, date_str):
+    y, m, d = date_str[:4], date_str[4:6], date_str[6:]
+    groups = []
+    for h in HOLDINGS:
+        if h["group"] not in groups:
+            groups.append(h["group"])
+
+    def color(v):
+        return "#e34948" if v > 0 else ("#1baf7a" if v < 0 else "#888")
+
+    sections = ""
+    pnl_list, up, dn, total = [], 0, 0, 0
+    for h in HOLDINGS:
+        p = price_map.get(h["code"])
+        if p:
+            total += 1
+            up += 1 if p["chg"] > 0 else 0
+            dn += 1 if p["chg"] < 0 else 0
+            pnl_list.append((p["price"] - h["cost"]) / h["cost"] * 100)
+    avg_pnl = sum(pnl_list) / len(pnl_list) if pnl_list else 0
+
+    for group in groups:
+        rows = ""
+        for h in [x for x in HOLDINGS if x["group"] == group]:
+            p = price_map.get(h["code"])
+            if not p:
+                rows += f'<tr><td style="padding:8px 6px;font-weight:500">{h["code"]}<br><span style="font-size:11px;color:#888">{h["name"]}</span></td><td colspan="5" style="font-size:12px;color:#888">資料暫無</td></tr>'
+                continue
+            pnl = (p["price"] - h["cost"]) / h["cost"] * 100
+            f, t = inst_map.get(h["code"], {}).get("foreign", 0), inst_map.get(h["code"], {}).get("trust", 0)
+            chip = "⭐ 雙買" if f > 0 and t > 0 else (f"外資 +{f}" if f > 0 else (f"投信 +{t}" if t > 0 else "—"))
+            rows += f"""<tr style="border-bottom:1px solid #eee">
+<td style="padding:8px 6px;font-weight:500">{h['code']}<br><span style="font-size:11px;color:#888">{h['name']}</span></td>
+<td style="padding:8px 6px;text-align:right;color:#888">{h['cost']:.1f}</td><td style="padding:8px 6px;text-align:right;font-weight:500">{p['price']:.2f}</td>
+<td style="padding:8px 6px;text-align:right;color:{color(p['chg'])}">{p['chg']:+.2f}<br><span style="font-size:10px">{p['chg_pct']:+.2f}%</span></td>
+<td style="padding:8px 6px;text-align:right;font-weight:500;color:{color(pnl)}">{pnl:+.1f}%</td><td style="padding:8px 6px;font-size:11px">{chip}</td></tr>"""
+        sections += f'<div style="margin-bottom:24px"><div style="font-size:13px;font-weight:600;margin:1rem 0 8px;padding-left:8px;border-left:3px solid #1a1a1a">{group}</div><table style="width:100%;border-collapse:collapse;font-size:13px;background:#fff"><thead><tr style="border-bottom:1px solid #ddd;color:#888"><th style="padding:7px 6px;text-align:left">代號/名稱</th><th style="padding:7px 6px;text-align:right">成本</th><th style="padding:7px 6px;text-align:right">現價</th><th style="padding:7px 6px;text-align:right">今日漲跌</th><th style="padding:7px 6px;text-align:right">損益%</th><th style="padding:7px 6px">今日籌碼</th></tr></thead><tbody>{rows}</tbody></table></div>'
+
+    summary = f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:1.5rem"><div style="background:#fff;border-radius:12px;padding:12px 14px">持股數<br><b>{total} 檔</b></div><div style="background:#fff;border-radius:12px;padding:12px 14px">平均損益<br><b style="color:{color(avg_pnl)}">{avg_pnl:+.1f}%</b></div><div style="background:#fff;border-radius:12px;padding:12px 14px">今日上漲<br><b style="color:#e34948">{up} 檔</b></div><div style="background:#fff;border-radius:12px;padding:12px 14px">今日下跌<br><b style="color:#1baf7a">{dn} 檔</b></div></div>'
+    return f'<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>持股追蹤 {y}/{m}/{d}</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#f5f5f5;color:#1a1a1a;margin:0;padding:0"><div style="max-width:900px;margin:0 auto;padding:24px 16px 60px"><div style="display:flex;align-items:baseline;gap:12px;margin-bottom:20px;border-bottom:2px solid #1a1a1a;padding-bottom:12px"><div style="font-size:22px;font-weight:700">📋 持股追蹤</div><div style="font-size:13px;color:#888">{y}/{m}/{d} 盤後 · <a href="index.html" style="color:#888">← 回首頁</a></div></div>{summary}{sections}</div></body></html>'
+
+
+def make_index_html(docs_dir):
+    reports_dir = os.path.join(docs_dir, "reports")
+    files = sorted([f for f in os.listdir(reports_dir) if f.endswith(".html")], reverse=True) if os.path.exists(reports_dir) else []
+    items = ""
+    for f in files:
+        ds = f.replace(".html", "")
+        if len(ds) == 8:
+            items += f'<li style="padding:10px 0;border-bottom:1px solid #f0f0f0"><a href="reports/{f}" style="color:#1a1a1a;text-decoration:none;font-size:15px">📊 {ds[:4]}/{ds[4:6]}/{ds[6:]} 籌碼日報</a></li>'
+    items = items or '<li style="padding:10px 0;color:#888;font-size:13px">尚無歷史報告，請先執行一次 GitHub Actions。</li>'
+    buttons = [
+        ("foreign.html", "🔵", "外資連買", "外資連續買超、5 日累計偏多"),
+        ("trust.html", "🟣", "投信連買", "投信連續買超、法人籌碼穩定"),
+        ("technical.html", "🔥", "技術面很強", "均線、KD、MACD、布林、爆量長紅"),
+        ("holdings.html", "📋", "我的持股追蹤", "成本、現價、損益、法人買賣超"),
+    ]
+    btn_html = "".join([f'<a href="{href}" style="background:#fff;border:1px solid #e5e5e5;border-radius:14px;padding:18px;text-decoration:none;color:#1a1a1a;box-shadow:0 1px 4px rgba(0,0,0,.04)"><div style="font-size:22px;margin-bottom:8px">{emoji}</div><div style="font-size:17px;font-weight:700">{title}</div><div style="font-size:12px;color:#888;margin-top:4px">{desc}</div></a>' for href, emoji, title, desc in buttons])
+    return f'<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>台股籌碼日報</title></head><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#f5f5f5;margin:0;padding:0;color:#1a1a1a"><div style="max-width:760px;margin:0 auto;padding:32px 16px 60px"><div style="font-size:24px;font-weight:700;margin-bottom:6px">📊 台股籌碼日報</div><div style="font-size:13px;color:#888;margin-bottom:24px">每日盤後自動更新 · 外資 / 投信 / 技術面 / 持股追蹤</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-bottom:28px">{btn_html}</div><div style="background:#fff;border-radius:14px;border:1px solid #e5e5e5;padding:16px"><div style="font-size:14px;font-weight:700;margin-bottom:10px">歷史報告</div><ul style="list-style:none;padding:0;margin:0">{items}</ul></div></div></body></html>'
+
+
+def make_csv(stocks):
+    out = io.StringIO()
+    if stocks:
+        fieldnames = [k for k in stocks[0] if not k.startswith("_")]
+        w = csv.DictWriter(out, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows([{k: v for k, v in s.items() if not k.startswith("_")} for s in stocks])
+    return out.getvalue()
+
+
+def main():
+    docs_dir = os.path.join(os.path.dirname(__file__), "..", "docs")
+    data_dir = os.path.join(docs_dir, "data")
+    reports_dir = os.path.join(docs_dir, "reports")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(reports_dir, exist_ok=True)
+
+    stocks, date_used, daily_inst = build_full_data(n_days=6)
+    if not stocks:
+        print("❌ 無資料，結束。")
+        return
+
+    ymd = date_used
+    today_price_map = fetch_price(date_used)
+
+    today_inst_map = {}
+    today_df = daily_inst.get(date_used)
+    if today_df is not None:
+        for _, row in today_df.iterrows():
+            code = str(row.get("證券代號", "")).strip()
+            f, t, _ = calc_institutional_row(row)
+            today_inst_map[code] = {"foreign": f, "trust": t}
+
+    with open(os.path.join(reports_dir, f"{ymd}.html"), "w", encoding="utf-8") as f:
+        f.write(make_dashboard_page(stocks, ymd, "report"))
+
+    with open(os.path.join(data_dir, f"{ymd}.json"), "w", encoding="utf-8") as f:
+        json.dump([{k: v for k, v in s.items() if k != "_candles"} for s in stocks], f, ensure_ascii=False)
+
+    pages = {
+        "foreign.html": make_dashboard_page(stocks, ymd, "foreign"),
+        "trust.html": make_dashboard_page(stocks, ymd, "trust"),
+        "technical.html": make_dashboard_page(stocks, ymd, "technical"),
+        "holdings.html": make_holdings_page(today_price_map, today_inst_map, ymd),
+        "index.html": make_index_html(docs_dir),
+    }
+    for name, html in pages.items():
+        with open(os.path.join(docs_dir, name), "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"✅ {name} 已更新")
+
+    csv_path = os.path.join(data_dir, f"{ymd}.csv")
+    with open(csv_path, "w", encoding="utf-8-sig") as f:
+        f.write(make_csv(stocks))
+    print(f"✅ CSV 已寫入：{csv_path}")
+
+
+if __name__ == "__main__":
+    main()
