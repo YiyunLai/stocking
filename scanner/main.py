@@ -10,6 +10,9 @@ import os
 import time
 import csv
 import io
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from holdings import HOLDINGS
 
 # ── 設定 ──────────────────────────────────────────────
 SENDER_EMAIL   = os.environ["GMAIL_USER"]
@@ -691,6 +694,131 @@ def make_report_page(stocks, date_str, review_html=""):
 </body></html>"""
 
 
+def make_holdings_page(price_map, inst_map, date_str):
+    """持股追蹤頁面：每天自動更新成本 vs 現價、損益、今日籌碼"""
+    y, m, d = date_str[:4], date_str[4:6], date_str[6:]
+    groups = []
+    seen = []
+    for h in HOLDINGS:
+        if h["group"] not in seen:
+            seen.append(h["group"])
+    groups = seen
+
+    def pnl_color(v):
+        if v > 0: return "#e34948"
+        if v < 0: return "#1baf7a"
+        return "var(--text-muted)"
+
+    def chip_badge(code):
+        d = inst_map.get(code, {})
+        f, t = d.get("foreign", 0), d.get("trust", 0)
+        if f > 0 and t > 0:
+            return f'<span style="font-size:10px;padding:2px 6px;border-radius:8px;background:#fff3cd;color:#856404;font-weight:500">⭐ 雙買 外+{f} 投+{t}</span>'
+        if f > 0:
+            return f'<span style="font-size:10px;padding:2px 6px;border-radius:8px;background:#d1ecf1;color:#0c5460;font-weight:500">外資 +{f}張</span>'
+        if t > 0:
+            return f'<span style="font-size:10px;padding:2px 6px;border-radius:8px;background:#e8d5f5;color:#6f42c1;font-weight:500">投信 +{t}張</span>'
+        if f < 0 or t < 0:
+            parts = []
+            if f != 0: parts.append(f"外{f:+d}")
+            if t != 0: parts.append(f"投{t:+d}")
+            return f'<span style="font-size:10px;padding:2px 6px;border-radius:8px;background:var(--surface-1);color:var(--text-muted)">{" ".join(parts) or "—"}</span>'
+        return '<span style="font-size:10px;color:var(--text-muted)">—</span>'
+
+    # 統計摘要
+    total, up, dn = 0, 0, 0
+    pnl_list = []
+    for h in HOLDINGS:
+        pd_ = price_map.get(h["code"])
+        if not pd_: continue
+        total += 1
+        chg = pd_["chg"]
+        if chg > 0: up += 1
+        elif chg < 0: dn += 1
+        pnl = (pd_["price"] - h["cost"]) / h["cost"] * 100
+        pnl_list.append(pnl)
+    avg_pnl = sum(pnl_list)/len(pnl_list) if pnl_list else 0
+    pnl_color_total = pnl_color(avg_pnl)
+
+    summary = f"""
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1.5rem">
+      <div style="background:var(--surface-1);border-radius:var(--radius);padding:12px 14px">
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">持股數</div>
+        <div style="font-size:20px;font-weight:500;color:var(--text-primary)">{total} 檔</div>
+      </div>
+      <div style="background:var(--surface-1);border-radius:var(--radius);padding:12px 14px">
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">平均損益</div>
+        <div style="font-size:20px;font-weight:500;color:{pnl_color_total}">{avg_pnl:+.1f}%</div>
+      </div>
+      <div style="background:var(--surface-1);border-radius:var(--radius);padding:12px 14px">
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">今日上漲</div>
+        <div style="font-size:20px;font-weight:500;color:#e34948">{up} 檔</div>
+      </div>
+      <div style="background:var(--surface-1);border-radius:var(--radius);padding:12px 14px">
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">今日下跌</div>
+        <div style="font-size:20px;font-weight:500;color:#1baf7a">{dn} 檔</div>
+      </div>
+    </div>"""
+
+    sections = ""
+    for group in groups:
+        group_stocks = [h for h in HOLDINGS if h["group"] == group]
+        rows = ""
+        for h in group_stocks:
+            pd_ = price_map.get(h["code"])
+            if not pd_:
+                rows += f'<tr><td style="padding:8px 6px;font-weight:500">{h["code"]}<br><span style="font-size:11px;color:var(--text-muted)">{h["name"]}</span></td><td colspan="5" style="font-size:12px;color:var(--text-muted)">資料暫無</td></tr>'
+                continue
+            price = pd_["price"]
+            chg   = pd_["chg"]
+            chg_pct = chg / (price - chg) * 100 if (price - chg) != 0 else 0
+            pnl   = (price - h["cost"]) / h["cost"] * 100
+            chg_c = pnl_color(chg)
+            pnl_c = pnl_color(pnl)
+            chg_s = "+" if chg > 0 else ""
+            pnl_s = "+" if pnl > 0 else ""
+            rows += f"""<tr style="border-bottom:0.5px solid var(--border)">
+  <td style="padding:8px 6px;font-weight:500">{h['code']}<br><span style="font-size:11px;color:var(--text-muted);font-weight:400">{h['name']}</span></td>
+  <td style="padding:8px 6px;text-align:right;color:var(--text-muted)">{h['cost']:.1f}</td>
+  <td style="padding:8px 6px;text-align:right;font-weight:500">{price:.2f}</td>
+  <td style="padding:8px 6px;text-align:right;color:{chg_c}">{chg_s}{chg:.2f}<br><span style="font-size:10px">{chg_s}{chg_pct:.2f}%</span></td>
+  <td style="padding:8px 6px;text-align:right;font-weight:500;color:{pnl_c}">{pnl_s}{pnl:.1f}%</td>
+  <td style="padding:8px 6px">{chip_badge(h['code'])}</td>
+</tr>"""
+
+        sections += f"""
+        <div style="margin-bottom:24px">
+          <div style="font-size:13px;font-weight:500;color:var(--text-secondary);margin:1rem 0 8px;padding-left:8px;border-left:3px solid var(--border-accent)">{group}</div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead><tr style="border-bottom:0.5px solid var(--border-strong)">
+              <th style="padding:7px 6px;text-align:left;font-size:11px;font-weight:500;color:var(--text-muted)">代號/名稱</th>
+              <th style="padding:7px 6px;text-align:right;font-size:11px;font-weight:500;color:var(--text-muted)">成本</th>
+              <th style="padding:7px 6px;text-align:right;font-size:11px;font-weight:500;color:var(--text-muted)">現價</th>
+              <th style="padding:7px 6px;text-align:right;font-size:11px;font-weight:500;color:var(--text-muted)">今日漲跌</th>
+              <th style="padding:7px 6px;text-align:right;font-size:11px;font-weight:500;color:var(--text-muted)">損益%</th>
+              <th style="padding:7px 6px;font-size:11px;font-weight:500;color:var(--text-muted)">今日籌碼</th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>持股追蹤 {y}/{m}/{d}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#1a1a1a;margin:0;padding:0">
+<div style="max-width:900px;margin:0 auto;padding:24px 16px 60px">
+  <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:20px;border-bottom:2px solid #1a1a1a;padding-bottom:12px">
+    <div style="font-size:22px;font-weight:700">持股追蹤</div>
+    <div style="font-size:13px;color:#888">{y}/{m}/{d} 盤後 · <a href="index.html" style="color:#888">← 回首頁</a></div>
+  </div>
+  {summary}
+  {sections}
+  <div style="border-top:1px solid #ddd;padding-top:14px;font-size:12px;color:#aaa">
+    紅漲綠跌 · 籌碼為當日三大法人買賣超 · 僅供參考
+  </div>
+</div></body></html>"""
+
 def make_html_summary(stocks, date_str):
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
     cats = ["雙主力連買", "外資連買", "投信連買"]
@@ -827,7 +955,11 @@ def make_index_html(docs_dir, pages_base_url):
 <body style="font-family:-apple-system,sans-serif;background:#f5f5f5;margin:0;padding:0">
 <div style="max-width:600px;margin:0 auto;padding:32px 16px">
   <div style="font-size:22px;font-weight:700;margin-bottom:6px">📊 台股籌碼日報</div>
-  <div style="font-size:13px;color:#888;margin-bottom:24px">每日盤後自動更新 · 外資/投信籌碼 + 技術面分析</div>
+  <div style="font-size:13px;color:#888;margin-bottom:20px">每日盤後自動更新 · 外資/投信籌碼 + 技術面分析</div>
+  <a href="holdings.html" style="display:block;background:#fff;border:2px solid #1a1a1a;border-radius:12px;padding:14px 16px;margin-bottom:20px;text-decoration:none;color:#1a1a1a">
+    <div style="font-size:15px;font-weight:600">📋 持股追蹤</div>
+    <div style="font-size:12px;color:#888;margin-top:3px">25 檔持股 · 每日更新損益與法人籌碼</div>
+  </a>
   <ul style="list-style:none;padding:0;margin:0;background:#fff;border-radius:12px;border:1px solid #e0e0e0;padding:0 16px">
     {items}
   </ul>
@@ -858,6 +990,16 @@ def main():
     # 今日股價 map（供昨日選股驗證用）
     today_price_map = fetch_price(date_used)
 
+    # 建立三大法人 map（供持股追蹤用）
+    today_inst_map = {}
+    today_inst_df = daily_inst.get(today_key)
+    if today_inst_df is not None:
+        for _, row in today_inst_df.iterrows():
+            code = str(row.get("證券代號","")).strip()
+            f = (parse_int(row.get("外陸資買進股數",0)) - parse_int(row.get("外陸資賣出股數",0))) // 1000
+            t = (parse_int(row.get("投信買進股數",0))   - parse_int(row.get("投信賣出股數",0)))   // 1000
+            today_inst_map[code] = {"foreign": f, "trust": t}
+
     # 昨日選股今日表現 HTML
     review_html = make_yesterday_review_html(yesterday_stocks, yesterday_date, today_price_map) if yesterday_stocks else ""
 
@@ -875,7 +1017,14 @@ def main():
         json.dump(stocks_to_save, f, ensure_ascii=False)
     print(f"✅ 選股資料已儲存：{json_path}")
 
-    # 3. 首頁：顯示所有歷史報告清單
+    # 3. 持股追蹤頁面（每天自動更新）
+    holdings_html = make_holdings_page(today_price_map, today_inst_map, date_used)
+    holdings_path = os.path.join(docs_dir, "holdings.html")
+    with open(holdings_path, "w", encoding="utf-8") as f:
+        f.write(holdings_html)
+    print(f"✅ 持股追蹤頁已更新：{holdings_path}")
+
+    # 4. 首頁：顯示所有歷史報告清單
     index_html = make_index_html(docs_dir, PAGES_BASE_URL)
     index_path = os.path.join(docs_dir, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
