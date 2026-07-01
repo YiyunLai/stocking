@@ -384,7 +384,11 @@ def build_full_data(n_days=6):
     print(f"✅ 今日股價 {date_used}：{len(price_map)} 筆")
 
     inst_history = {}
+    _fields_printed = False
     for day_key, df in daily_inst.items():
+        if not _fields_printed:
+            print(f"  ℹ️ T86 欄位：{list(df.columns)}")
+            _fields_printed = True
         for _, row in df.iterrows():
             code = str(row.get("證券代號","")).strip()
             if len(code) != 4:
@@ -408,6 +412,10 @@ def build_full_data(n_days=6):
         foreign_today = today_data["f"]
         trust_today   = today_data["t"]
         dealer_today  = today_data["d"]
+
+        # debug：印出前5檔的外資/投信數值
+        if len(stocks) < 5:
+            print(f"  DEBUG {code}: foreign={foreign_today}, trust={trust_today}")
 
         # 連買天數（先算，用來當篩選條件）
         f_consec = 0
