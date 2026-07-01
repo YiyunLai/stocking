@@ -586,7 +586,7 @@ def render_mini_candlestick_svg(candles, width=260, height=110):
         '</svg>'
     )
 
-def make_report_page(stocks, date_str):
+def make_report_page(stocks, date_str, review_html=""):
     """完整版報告網頁（含K線圖），用於 GitHub Pages 發布"""
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
     cats = ["雙主力連買", "外資連買", "投信連買"]
@@ -682,6 +682,7 @@ def make_report_page(stocks, date_str):
     <div style="font-size:24px;font-weight:700">📊 台股籌碼日報</div>
     <div style="font-size:13px;color:#888;margin-top:4px">{y}/{m}/{d} 盤後 · 共 {len(stocks)} 檔入選 · 資料來源：TWSE、富果行情 API</div>
   </div>
+  {review_html}
   {sections}
   <div style="border-top:1px solid #ddd;padding-top:16px;margin-top:20px;font-size:12px;color:#aaa">
     僅供參考，不構成投資建議 · 每日約 17:30 自動更新
@@ -745,7 +746,107 @@ def send_email(html_body, csv_str, date_str, stock_count):
         server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
     print(f"✅ 已寄出：{subject}")
 
+def load_yesterday_stocks(docs_dir):
+    """讀取昨天的選股 JSON，供「昨日選股今日表現」使用"""
+    data_dir = os.path.join(docs_dir, "data")
+    if not os.path.exists(data_dir):
+        return None, None
+    files = sorted([f for f in os.listdir(data_dir) if f.endswith(".json")])
+    if not files:
+        return None, None
+    latest_file = os.path.join(data_dir, files[-1])
+    date_str = files[-1].replace(".json", "")
+    try:
+        with open(latest_file, "r", encoding="utf-8") as f:
+            import json
+            return json.load(f), date_str
+    except:
+        return None, None
+
+def make_yesterday_review_html(yesterday_stocks, yesterday_date, today_price_map):
+    """產生「昨日選股今日表現」區塊 HTML"""
+    if not yesterday_stocks or not today_price_map:
+        return ""
+
+    y, m, d = yesterday_date[:4], yesterday_date[4:6], yesterday_date[6:]
+    rows = ""
+    for s in yesterday_stocks:
+        code = s["代號"]
+        today = today_price_map.get(code)
+        if not today:
+            continue
+        chg = today["chg_pct"]
+        chg_color = "#e34948" if chg >= 0 else "#1baf7a"
+        chg_sign  = "+" if chg >= 0 else ""
+        chip_colors = {
+            "雙主力連買": "#856404",
+            "外資連買":   "#0c5460",
+            "投信連買":   "#6f42c1",
+        }
+        chip_color = chip_colors.get(s.get("籌碼類型",""), "#888")
+        rows += f"""<tr style="border-bottom:1px solid #f5f5f5">
+  <td style="padding:8px 6px;font-weight:500">{code}<br><span style="font-size:11px;color:#888">{s['名稱']}</span></td>
+  <td style="padding:8px 6px;font-size:12px;color:{chip_color}">{s.get('籌碼類型','')}</td>
+  <td style="padding:8px 6px;text-align:right">{s['收盤價']:.2f}</td>
+  <td style="padding:8px 6px;text-align:right;font-size:13px;font-weight:600;color:{chg_color}">{chg_sign}{chg:.2f}%</td>
+</tr>"""
+
+    if not rows:
+        return ""
+
+    return f"""<section style="margin-bottom:36px;background:#fff;border:1px solid #e0e0e0;border-radius:12px;padding:18px 16px">
+  <div style="font-size:16px;font-weight:700;margin-bottom:4px">📅 昨日選股今日表現 <span style="font-size:12px;font-weight:400;color:#888">（{y}/{m}/{d} 入選）</span></div>
+  <div style="font-size:12px;color:#aaa;margin-bottom:12px">以下為昨日籌碼選出的個股，今日收盤表現</div>
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="background:#f8f8f8;color:#555">
+      <th style="padding:7px 6px;text-align:left">代號/名稱</th>
+      <th style="padding:7px 6px;text-align:left">籌碼類型</th>
+      <th style="padding:7px 6px;text-align:right">昨收</th>
+      <th style="padding:7px 6px;text-align:right">今日漲跌</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</section>"""
+
+def make_index_html(docs_dir, pages_base_url):
+    """掃描 docs/reports/ 產生所有歷史報告的清單"""
+    reports_dir = os.path.join(docs_dir, "reports")
+    if not os.path.exists(reports_dir):
+        return ""
+    files = sorted([f for f in os.listdir(reports_dir) if f.endswith(".html")], reverse=True)
+    items = ""
+    for f in files:
+        date_str = f.replace(".html", "")
+        if len(date_str) == 8:
+            label = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
+            items += f'<li style="padding:10px 0;border-bottom:1px solid #f0f0f0"><a href="reports/{f}" style="color:#1a1a1a;text-decoration:none;font-size:15px">📊 {label} 籌碼日報</a></li>'
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台股籌碼日報</title></head>
+<body style="font-family:-apple-system,sans-serif;background:#f5f5f5;margin:0;padding:0">
+<div style="max-width:600px;margin:0 auto;padding:32px 16px">
+  <div style="font-size:22px;font-weight:700;margin-bottom:6px">📊 台股籌碼日報</div>
+  <div style="font-size:13px;color:#888;margin-bottom:24px">每日盤後自動更新 · 外資/投信籌碼 + 技術面分析</div>
+  <ul style="list-style:none;padding:0;margin:0;background:#fff;border-radius:12px;border:1px solid #e0e0e0;padding:0 16px">
+    {items}
+  </ul>
+</div></body></html>"""
+
 def main():
+    import json
+
+    docs_dir = os.path.join(os.path.dirname(__file__), "..", "docs")
+    os.makedirs(docs_dir, exist_ok=True)
+    data_dir = os.path.join(docs_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    reports_dir = os.path.join(docs_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+
+    # 讀取昨日選股（在抓今日資料前先讀，因為 build_full_data 會覆蓋 price_map）
+    yesterday_stocks, yesterday_date = load_yesterday_stocks(docs_dir)
+
+    # 抓今日資料
     stocks, date_used = build_full_data(n_days=6)
     if not stocks:
         print("❌ 無資料，結束。")
@@ -754,25 +855,34 @@ def main():
 
     y, m, d = date_used[:4], date_used[4:6], date_used[6:]
 
-    # 1. 完整報告網頁（含K線圖）→ 輸出到 docs/reports/，供 GitHub Pages 發布
-    report_html = make_report_page(stocks, date_used)
-    reports_dir = os.path.join(os.path.dirname(__file__), "..", "docs", "reports")
-    os.makedirs(reports_dir, exist_ok=True)
+    # 今日股價 map（供昨日選股驗證用）
+    today_price_map = fetch_price(date_used)
+
+    # 昨日選股今日表現 HTML
+    review_html = make_yesterday_review_html(yesterday_stocks, yesterday_date, today_price_map) if yesterday_stocks else ""
+
+    # 1. 完整報告網頁（含K線圖 + 昨日選股回顧）
+    report_html = make_report_page(stocks, date_used, review_html)
     report_path = os.path.join(reports_dir, f"{y}{m}{d}.html")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_html)
     print(f"✅ 報告網頁已寫入：{report_path}")
 
-    # 2. 首頁（docs/index.html）導向最新報告，方便直接開根網址就看到今天
-    docs_dir = os.path.join(os.path.dirname(__file__), "..", "docs")
+    # 2. 儲存今日選股 JSON（供明天「昨日表現」使用，不含 K 線原始資料）
+    stocks_to_save = [{k: v for k, v in s.items() if k != "_candles"} for s in stocks]
+    json_path = os.path.join(data_dir, f"{y}{m}{d}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(stocks_to_save, f, ensure_ascii=False)
+    print(f"✅ 選股資料已儲存：{json_path}")
+
+    # 3. 首頁：顯示所有歷史報告清單
+    index_html = make_index_html(docs_dir, PAGES_BASE_URL)
     index_path = os.path.join(docs_dir, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
-        f.write(f'<!DOCTYPE html><html><head><meta charset="utf-8">'
-                 f'<meta http-equiv="refresh" content="0; url=reports/{y}{m}{d}.html"></head>'
-                 f'<body>導向最新報告...<a href="reports/{y}{m}{d}.html">點此查看</a></body></html>')
-    print(f"✅ 首頁導向已更新：{index_path}")
+        f.write(index_html)
+    print(f"✅ 首頁清單已更新：{index_path}")
 
-    # 3. CSV + Email（內容為摘要＋報告連結）
+    # 4. CSV + Email
     csv_str = make_csv(stocks)
     html    = make_html_summary(stocks, date_used)
     send_email(html, csv_str, date_used, len(stocks))
