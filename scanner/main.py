@@ -400,11 +400,7 @@ def build_full_data(n_days=6):
         trust_today   = today_data["t"]
         dealer_today  = today_data["d"]
 
-        if foreign_today < 50 and trust_today < 10:
-            continue
-        if foreign_today <= 0 and trust_today <= 0:
-            continue
-
+        # 連買天數（先算，用來當篩選條件）
         f_consec = 0
         for day in sorted_days:
             if hist.get(day, {}).get("f", 0) > 0:
@@ -419,6 +415,18 @@ def build_full_data(n_days=6):
             else:
                 break
 
+        # 篩選條件：外資連買 ≥ 1天，OR 投信連買 ≥ 1天
+        if f_consec == 0 and t_consec == 0:
+            continue
+
+        # 籌碼分組標籤
+        if f_consec >= 1 and t_consec >= 1:
+            chip_type = "雙主力連買"
+        elif f_consec >= 1:
+            chip_type = "外資連買"
+        else:
+            chip_type = "投信連買"
+
         five_days = sorted_days[:5]
         f_5d = sum(hist.get(d,{}).get("f",0) for d in five_days)
         t_5d = sum(hist.get(d,{}).get("t",0) for d in five_days)
@@ -427,7 +435,8 @@ def build_full_data(n_days=6):
         stocks.append({
             "代號": code,
             "名稱": pd_info["name"],
-            "類型": "",  # 待技術面資料補齊後分類
+            "類型": "",        # 技術面分類（低位啟動/強勢噴出/趨勢持續）
+            "籌碼類型": chip_type,  # 外資連買/投信連買/雙主力連買
             "收盤價": pd_info["price"],
             "漲跌%": round(pd_info["chg_pct"], 2),
             "外資今日(張)": foreign_today,
@@ -448,7 +457,11 @@ def build_full_data(n_days=6):
             "_candles": [],
         })
 
-    stocks.sort(key=lambda x: -(abs(x["外資今日(張)"]) + abs(x["投信今日(張)"]) * 3))
+    chip_order = {"雙主力連買": 0, "外資連買": 1, "投信連買": 2}
+    stocks.sort(key=lambda x: (
+        chip_order.get(x["籌碼類型"], 9),
+        -(x["外資連買天數"] + x["投信連買天數"])
+    ))
 
     # 技術面 + 股權分散逐檔補齊
     has_fugle = bool(FUGLE_API_KEY)
@@ -576,11 +589,11 @@ def render_mini_candlestick_svg(candles, width=260, height=110):
 def make_report_page(stocks, date_str):
     """完整版報告網頁（含K線圖），用於 GitHub Pages 發布"""
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
-    cats = ["強勢噴出", "低位啟動", "趨勢持續"]
+    cats = ["雙主力連買", "外資連買", "投信連買"]
     cat_desc = {
-        "強勢噴出": ("🔴", "強勢噴出", "股價接近52週高點、近期漲幅強、法人買超，適合追強短線"),
-        "低位啟動": ("🟢", "低位啟動", "股價位於52週相對低位、剛站上/翻揚MA20，適合波段布局"),
-        "趨勢持續": ("🟡", "趨勢持續", "介於兩者之間，法人持續買進，適合持有或輕追"),
+        "雙主力連買": ("⭐", "雙主力連買", "外資 + 投信同時連續買超，最強籌碼訊號"),
+        "外資連買":   ("🔵", "外資連買",   "外資連續買超，法人主導明確"),
+        "投信連買":   ("🟣", "投信連買",   "投信連續買超，通常伴隨題材或基本面邏輯"),
     }
 
     def tag_html(label, active):
@@ -593,12 +606,23 @@ def make_report_page(stocks, date_str):
 
     cards_by_cat = {}
     for cat in cats:
-        group = [s for s in stocks if s["類型"] == cat]
+        group = [s for s in stocks if s["籌碼類型"] == cat]
         cards = ""
         for s in group:
             chg_color = "#e34948" if s["漲跌%"] >= 0 else "#1baf7a"
             chg_sign  = "+" if s["漲跌%"] >= 0 else ""
             chart_svg = render_mini_candlestick_svg(s.get("_candles", []))
+
+            chip_colors = {
+                "雙主力連買": ("#fff3cd", "#856404", "⭐"),
+                "外資連買":   ("#d1ecf1", "#0c5460", "🔵"),
+                "投信連買":   ("#e8d5f5", "#6f42c1", "🟣"),
+            }
+            chip_bg, chip_fg, chip_icon = chip_colors.get(s["籌碼類型"], ("#f0f0f0","#555",""))
+            chip_badge = f'<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:{chip_bg};color:{chip_fg};font-weight:600">{chip_icon} {s["籌碼類型"]}</span>'
+            consec_label = f'外資連{s["外資連買天數"]}天' if s["外資連買天數"] > 0 else ""
+            if s["投信連買天數"] > 0:
+                consec_label += f'{"｜" if consec_label else ""}投信連{s["投信連買天數"]}天'
 
             tags_html = "".join([
                 tag_html("均線多頭", s["均線多頭"]=="是"),
@@ -615,7 +639,7 @@ def make_report_page(stocks, date_str):
               <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
                 <div>
                   <div style="font-size:15px;font-weight:600">{s['代號']} {s['名稱']}</div>
-                  <div style="font-size:12px;color:#888;margin-top:2px">52週位階 {pct_label}</div>
+                  <div style="font-size:12px;color:#888;margin-top:2px">{chip_badge} <span style="color:#aaa">{consec_label}</span></div>
                 </div>
                 <div style="text-align:right">
                   <div style="font-size:17px;font-weight:600">{s['收盤價']:.2f}</div>
@@ -668,13 +692,13 @@ def make_report_page(stocks, date_str):
 
 def make_html_summary(stocks, date_str):
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
-    cats = ["強勢噴出", "低位啟動", "趨勢持續"]
-    cat_emoji = {"強勢噴出": "🔴", "低位啟動": "🟢", "趨勢持續": "🟡"}
+    cats = ["雙主力連買", "外資連買", "投信連買"]
+    cat_emoji = {"雙主力連買": "⭐", "外資連買": "🔵", "投信連買": "🟣"}
     REPORT_URL = f"{PAGES_BASE_URL}/reports/{y}{m}{d}.html" if PAGES_BASE_URL else "#"
 
     counts_html = ""
     for cat in cats:
-        n = len([s for s in stocks if s["類型"] == cat])
+        n = len([s for s in stocks if s["籌碼類型"] == cat])
         if n == 0:
             continue
         counts_html += f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0"><span>{cat_emoji[cat]} {cat}</span><span style="font-weight:600">{n} 檔</span></div>'
