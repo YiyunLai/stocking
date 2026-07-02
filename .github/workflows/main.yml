@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests pandas
 
-      - name: Run scanner & send email
+      - name: Run scanner
         env:
           GMAIL_USER:    ${{ secrets.GMAIL_USER }}
           GMAIL_TO:      ${{ secrets.GMAIL_TO }}
@@ -32,6 +32,11 @@ jobs:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scanner/main.py
+
+      - name: Build categorized dashboard and stock detail pages
+        env:
+          FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
+        run: python scanner/postprocess.py
 
       - name: Commit & push report page
         run: |
