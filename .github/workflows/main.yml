@@ -36,7 +36,7 @@ jobs:
       - name: Build categorized dashboard and stock detail pages
         env:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
-        run: run: python scanner/price_volume_pages.py
+        run: python scanner/price_volume_pages.py
 
       - name: Commit & push report page
         run: |
