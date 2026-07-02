@@ -61,24 +61,36 @@ def sr(cs,close):
     else: txt='目前位於短線支撐與壓力中間，等待突破或回測較明確。'
     return p20,p60,s20,s60,txt
 
-def svg(cs,W=860,PH=240,VH=80):
+def svg(cs,W=860,PH=250,VH=80):
     if not cs: return '<div class="empty">沒有足夠走勢資料</div>'
-    cs=cs[-120:]; H=PH+VH+25; hi=max(num(x['high']) for x in cs); lo=min(num(x['low']) for x in cs); vr=hi-lo or 1
+    cs=cs[-120:]; H=PH+VH+32; hi=max(num(x['high']) for x in cs); lo=min(num(x['low']) for x in cs); vr=hi-lo or 1
     vmax=max(num(x['volume']) for x in cs) or 1; cw=W/len(cs); bw=max(cw*.55,1.5)
-    def y(v): return PH-((v-lo)/vr)*(PH-18)+8
-    def vy(v): return PH+18+VH-(v/vmax)*(VH-8)
-    out=[f'<svg width="100%" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" class="chart">','<text x="12" y="20" fill="#9ca3af" font-size="12">近120日價量走勢 黃線=MA20</text>']
+    def y(v): return PH-((v-lo)/vr)*(PH-24)+16
+    def vy(v): return PH+22+VH-(v/vmax)*(VH-8)
+    out=[f'<svg width="100%" height="{H}" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" class="chart">']
+    out.append('<text x="12" y="20" fill="#9ca3af" font-size="12">近120日價量走勢</text>')
+    legend=[('MA5','#60a5fa'),('MA10','#a78bfa'),('MA20','#facc15'),('MA60','#fb923c')]
+    lx=120
+    for name,col in legend:
+        out.append(f'<line x1="{lx}" y1="16" x2="{lx+22}" y2="16" stroke="{col}" stroke-width="2"/>')
+        out.append(f'<text x="{lx+28}" y="20" fill="{col}" font-size="12">{name}</text>')
+        lx+=86
+    for rr in [0.25,0.5,0.75]:
+        gy=28+rr*(PH-36)
+        out.append(f'<line x1="0" y1="{gy:.1f}" x2="{W}" y2="{gy:.1f}" stroke="#1f2937" stroke-width="1"/>')
     closes=[num(x['close']) for x in cs]
-    if len(closes)>=20:
-        pts=[]
-        for k in range(19,len(closes)):
-            ma=sum(closes[k-19:k+1])/20; pts.append(f'{k*cw+cw/2:.1f},{y(ma):.1f}')
-        out.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#facc15" stroke-width="1.8"/>')
+    for period,col in [(5,'#60a5fa'),(10,'#a78bfa'),(20,'#facc15'),(60,'#fb923c')]:
+        if len(closes)>=period:
+            pts=[]
+            for k in range(period-1,len(closes)):
+                ma=sum(closes[k-period+1:k+1])/period
+                pts.append(f'{k*cw+cw/2:.1f},{y(ma):.1f}')
+            out.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{col}" stroke-width="1.8" opacity="0.95"/>')
     for k,c in enumerate(cs):
         x=k*cw+cw/2; o=num(c['open']); cl=num(c['close']); h=num(c['high']); l=num(c['low']); v=num(c['volume']); col='#ef4444' if cl>=o else '#22c55e'; yo=y(o); yc=y(cl)
-        out.append(f'<line x1="{x:.1f}" y1="{y(h):.1f}" x2="{x:.1f}" y2="{y(l):.1f}" stroke="{col}"/>')
+        out.append(f'<line x1="{x:.1f}" y1="{y(h):.1f}" x2="{x:.1f}" y2="{y(l):.1f}" stroke="{col}" stroke-width="1"/>')
         out.append(f'<rect x="{x-bw/2:.1f}" y="{min(yo,yc):.1f}" width="{bw:.1f}" height="{max(abs(yc-yo),1):.1f}" fill="{col}"/>')
-        out.append(f'<rect x="{x-bw/2:.1f}" y="{vy(v):.1f}" width="{bw:.1f}" height="{max(PH+18+VH-vy(v),1):.1f}" fill="{col}" opacity=".5"/>')
+        out.append(f'<rect x="{x-bw/2:.1f}" y="{vy(v):.1f}" width="{bw:.1f}" height="{max(PH+22+VH-vy(v),1):.1f}" fill="{col}" opacity=".5"/>')
     out.append('</svg>'); return ''.join(out)
 
 def tech_count(s): return sum(1 for x in ['均線多頭','KD黃金交叉','MACD翻多','布林突破','爆量長紅'] if s.get(x)=='是')
