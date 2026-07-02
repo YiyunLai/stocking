@@ -1,47 +1,46 @@
-name: 台股籌碼日報
+name: stock report
 
 on:
   schedule:
-    # 每天 UTC 09:30 = 台灣時間 17:30（盤後資料通常 16:30–17:00 公布）
     - cron: "30 9 * * 1-5"
-  workflow_dispatch:   # 允許手動觸發
+  workflow_dispatch:
 
 permissions:
-  contents: write   # 需要寫入權限才能 commit 報告檔案回 repo
+  contents: write
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: setup python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: install dependencies
         run: pip install requests pandas
 
-      - name: Run scanner
+      - name: run scanner
         env:
-          GMAIL_USER:    ${{ secrets.GMAIL_USER }}
-          GMAIL_TO:      ${{ secrets.GMAIL_TO }}
-          GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scanner/main.py
 
-      - name: Build categorized dashboard and stock detail pages
+      - name: build price volume pages
         env:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
         run: python scanner/price_volume_pages.py
 
-      - name: Commit & push report page
+      - name: build streak filter pages
+        run: python scanner/streak_filter_pages.py
+
+      - name: commit pages
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name bot
+          git config user.email bot@example.com
           git add docs/
-          git diff --staged --quiet || git commit -m "📊 更新每日報告 $(date +'%Y-%m-%d')"
+          git diff --staged --quiet || git commit -m "update stock pages"
           git push
